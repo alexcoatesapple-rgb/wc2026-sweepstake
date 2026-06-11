@@ -32,6 +32,62 @@ const TEAMS = [
 
 const TEAM = Object.fromEntries(TEAMS.map(t => [t.id, t]));
 
+/* ---- draw import helpers ---- */
+
+function findTeamId(cell) {
+  if (!cell) return null;
+  // Strip non-ASCII (emoji / flag sequences) to get the plain Latin name
+  const stripped = cell.replace(/[^\x00-\x7F]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+  for (const t of TEAMS) {
+    const tStripped = t.name.replace(/[^\x00-\x7F]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (stripped === tStripped) return t.id;
+  }
+  // Fallback: substring match (handles "France 🇫🇷" containing "France")
+  const cellLower = cell.toLowerCase();
+  for (const t of TEAMS) {
+    if (cellLower.includes(t.name.toLowerCase())) return t.id;
+  }
+  return null;
+}
+
+function parseDrawTable(text) {
+  if (!text.trim()) return { error: "Paste your draw table first." };
+  const lines = text.trim().split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return { error: "Need at least a header row and one participant." };
+  // Auto-detect and skip header row
+  const firstCols = lines[0].split("\t").map(s => s.trim());
+  const firstCell = firstCols[0].toLowerCase();
+  const hasHeader =
+    firstCell === "participant" || firstCell === "name" || firstCell === "player" ||
+    (firstCols[1] && !findTeamId(firstCols[1]));
+  const dataLines = hasHeader ? lines.slice(1) : lines;
+  if (dataLines.length < 2) return { error: "Need at least two participants." };
+  const stamp = Date.now().toString(36);
+  const parts = [];
+  const assignments = {};
+  const errors = [];
+  dataLines.forEach((line, i) => {
+    const cols = line.split("\t").map(s => s.trim());
+    if (cols.length < 2) return;
+    const name = cols[0];
+    if (!name) return;
+    const id = `p${i}_${stamp}`;
+    parts.push({ id, name });
+    const teamIds = [];
+    for (let ci = 1; ci < cols.length; ci++) {
+      const cell = cols[ci];
+      if (!cell) continue;
+      const tid = findTeamId(cell);
+      if (tid) teamIds.push(tid);
+      else errors.push(`"${cell}" not recognised (${name})`);
+    }
+    assignments[id] = teamIds;
+  });
+  if (parts.length < 2) return { error: "Could not parse participants — check the format." };
+  const teamsPer = Math.max(...Object.values(assignments).map(a => a.length));
+  return { parts, assignments, teamsPer, errors };
+}
+
 const STAGES = [
   { id: "GROUP", label: "Group stage",    short: "GRP", ko: false },
   { id: "R32",   label: "Round of 32",    short: "R32", ko: true  },
@@ -531,11 +587,17 @@ function Splash({ text }) {
 
 /* ---- Setup ---- */
 function SetupScreen({ onComplete }) {
+  const [mode, setMode]         = useState("draw");
+  // random-draw state
   const [name, setName]         = useState("World Cup 2026 Sweepstake");
   const [namesText, setNamesText] = useState("");
   const [teamsPer, setTeamsPer] = useState(null);
   const [pin, setPin]           = useState("");
   const [err, setErr]           = useState("");
+  // import state
+  const [importText, setImportText]     = useState("");
+  const [importPreview, setImportPreview] = useState(null);
+  const [importErr, setImportErr]       = useState("");
 
   const names  = namesText.split("\n").map(s => s.trim()).filter(Boolean);
   const maxPer = names.length >= 2 ? Math.floor(48 / names.length) : 0;
@@ -562,6 +624,31 @@ function SetupScreen({ onComplete }) {
     });
   }
 
+  function handleParseImport() {
+    setImportErr("");
+    const result = parseDrawTable(importText);
+    if (result.error) { setImportErr(result.error); return; }
+    setImportPreview(result);
+    if (result.errors?.length) setImportErr("Warnings: " + result.errors.join(", "));
+  }
+
+  function goImport() {
+    if (!importPreview) return;
+    onComplete({
+      name: name.trim() || "World Cup 2026 Sweepstake",
+      createdAt: new Date().toISOString(),
+      parts: importPreview.parts,
+      assignments: importPreview.assignments,
+      teamsPer: importPreview.teamsPer,
+      scoring: { ...DEFAULT_SCORING },
+      results: [],
+      groupWinners: {},
+      eliminated: {},
+      previousRankings: {},
+      pin: pin.trim() || null,
+    });
+  }
+
   return (
     <div className="setup">
       <div className="setup-eyebrow">USA · CANADA · MEXICO — SUMMER 2026</div>
@@ -570,53 +657,151 @@ function SetupScreen({ onComplete }) {
         Names go in, teams come out. A banded draw deals every player one team from each
         strength band so nobody can moan about the hat.
       </p>
-      <div className="card">
-        <label className="lbl">Sweepstake name</label>
-        <input className="inp" value={name} onChange={e => setName(e.target.value)} />
 
-        <label className="lbl">Players — one per line</label>
-        <textarea
-          className="inp ta"
-          rows={8}
-          placeholder={"Alex\nHarry\nCam\nAdam\n…"}
-          value={namesText}
-          onChange={e => { setNamesText(e.target.value); setErr(""); }}
-        />
+      <div className="mode-toggle">
+        <button
+          className={cls("mode-btn", mode === "draw" && "mode-btn-on")}
+          onClick={() => setMode("draw")}
+        >🎲 Random draw</button>
+        <button
+          className={cls("mode-btn", mode === "import" && "mode-btn-on")}
+          onClick={() => setMode("import")}
+        >📋 Import draw</button>
+      </div>
 
-        {names.length >= 2 && (
-          <div className="setup-mathrow">
-            <div className="setup-count">
-              <span className="mono big">{names.length}</span> players
-            </div>
-            <div className="setup-per">
-              <label className="lbl" style={{ margin: 0 }}>Teams each</label>
-              <div className="stepper">
-                <button className="step" onClick={() => setTeamsPer(Math.max(1, per - 1))}>−</button>
-                <span className="mono big">{per}</span>
-                <button className="step" onClick={() => setTeamsPer(Math.min(maxPer, per + 1))}>+</button>
+      {mode === "draw" && (
+        <div className="card">
+          <label className="lbl">Sweepstake name</label>
+          <input className="inp" value={name} onChange={e => setName(e.target.value)} />
+
+          <label className="lbl">Players — one per line</label>
+          <textarea
+            className="inp ta"
+            rows={8}
+            placeholder={"Alex\nHarry\nCam\nAdam\n…"}
+            value={namesText}
+            onChange={e => { setNamesText(e.target.value); setErr(""); }}
+          />
+
+          {names.length >= 2 && (
+            <div className="setup-mathrow">
+              <div className="setup-count">
+                <span className="mono big">{names.length}</span> players
+              </div>
+              <div className="setup-per">
+                <label className="lbl" style={{ margin: 0 }}>Teams each</label>
+                <div className="stepper">
+                  <button className="step" onClick={() => setTeamsPer(Math.max(1, per - 1))}>−</button>
+                  <span className="mono big">{per}</span>
+                  <button className="step" onClick={() => setTeamsPer(Math.min(maxPer, per + 1))}>+</button>
+                </div>
+              </div>
+              <div className="setup-used">
+                <span className="mono big">{used}</span>/48 teams used
+                {used < 48 && <span className="dim"> · weakest {48 - used} dropped</span>}
               </div>
             </div>
-            <div className="setup-used">
-              <span className="mono big">{used}</span>/48 teams used
-              {used < 48 && <span className="dim"> · weakest {48 - used} dropped</span>}
-            </div>
+          )}
+
+          <label className="lbl">Organiser PIN <span className="dim">(optional)</span></label>
+          <input
+            className="inp"
+            style={{ maxWidth: 160 }}
+            placeholder="e.g. 2026"
+            value={pin}
+            onChange={e => setPin(e.target.value)}
+          />
+
+          {err && <div className="err">{err}</div>}
+          <button className="btn-primary" onClick={go} disabled={names.length < 2}>
+            Run the draw
+          </button>
+        </div>
+      )}
+
+      {mode === "import" && (
+        <div className="card">
+          <label className="lbl">Sweepstake name</label>
+          <input className="inp" value={name} onChange={e => setName(e.target.value)} />
+
+          <label className="lbl">Organiser PIN <span className="dim">(optional)</span></label>
+          <input
+            className="inp"
+            style={{ maxWidth: 160 }}
+            placeholder="e.g. 2026"
+            value={pin}
+            onChange={e => setPin(e.target.value)}
+          />
+
+          <label className="lbl">Paste draw table</label>
+          <div className="dim small" style={{ marginBottom: 8 }}>
+            Tab-separated. First column: participant name. Remaining columns: team names (flags optional).
+            Copy-paste directly from Excel or Google Sheets works perfectly.
           </div>
-        )}
+          <textarea
+            className="inp ta"
+            rows={10}
+            placeholder={"PARTICIPANT\tTIER 1\tTIER 2\t…\nAlex\tFrance 🇫🇷\tUSA 🇺🇸\t…"}
+            value={importText}
+            onChange={e => {
+              setImportText(e.target.value);
+              setImportPreview(null);
+              setImportErr("");
+            }}
+          />
 
-        <label className="lbl">Organiser PIN <span className="dim">(optional)</span></label>
-        <input
-          className="inp"
-          style={{ maxWidth: 160 }}
-          placeholder="e.g. 2026"
-          value={pin}
-          onChange={e => setPin(e.target.value)}
-        />
+          {importErr && (
+            <div className={importPreview ? "warn" : "err"} style={{ whiteSpace: "pre-wrap" }}>
+              {importErr}
+            </div>
+          )}
 
-        {err && <div className="err">{err}</div>}
-        <button className="btn-primary" onClick={go} disabled={names.length < 2}>
-          Run the draw
-        </button>
-      </div>
+          {importPreview && (
+            <div className="import-preview">
+              <div className="import-preview-title">
+                ✓ {importPreview.parts.length} participants · {importPreview.teamsPer} teams each
+              </div>
+              {importPreview.parts.map(p => (
+                <div key={p.id} className="import-row">
+                  <span className="import-name">{p.name}</span>
+                  <span className="import-flags">
+                    {(importPreview.assignments[p.id] || []).map(tid => {
+                      const t = TEAM[tid];
+                      return t ? <span key={tid} title={t.name}>{t.flag}</span> : null;
+                    })}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="frow" style={{ marginTop: 16 }}>
+            {!importPreview ? (
+              <button
+                className="btn-primary"
+                style={{ marginTop: 0 }}
+                onClick={handleParseImport}
+                disabled={!importText.trim()}
+              >
+                Parse draw
+              </button>
+            ) : (
+              <>
+                <button className="btn-primary" style={{ marginTop: 0 }} onClick={goImport}>
+                  Load this draw →
+                </button>
+                <button
+                  className="btn-ghost"
+                  style={{ marginTop: 0 }}
+                  onClick={() => { setImportPreview(null); setImportErr(""); }}
+                >
+                  Re-parse
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -982,9 +1167,42 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
 function SetupView({ state, commit, unlocked, tryUnlock, showReveal, resetAll }) {
   const [sc, setSc]   = useState({ ...DEFAULT_SCORING, ...(state.scoring || {}) });
   const [pin, setPin] = useState(state.pin || "");
+  const [showImport, setShowImport]     = useState(false);
+  const [importText, setImportText]     = useState("");
+  const [importPreview, setImportPreview] = useState(null);
+  const [importErr, setImportErr]       = useState("");
 
   function guard(fn) {
     return () => { if (!unlocked) { tryUnlock(); return; } fn(); };
+  }
+
+  function handleParseImport() {
+    setImportErr("");
+    const result = parseDrawTable(importText);
+    if (result.error) { setImportErr(result.error); return; }
+    setImportPreview(result);
+    if (result.errors?.length) setImportErr("Warnings: " + result.errors.join(", "));
+  }
+
+  function applyImport() {
+    if (!importPreview) return;
+    if (!window.confirm(
+      `Replace the current draw with the imported one? Results stay, but points will reflect new assignments.`
+    )) return;
+    commit({
+      ...state,
+      parts: importPreview.parts,
+      assignments: importPreview.assignments,
+      teamsPer: importPreview.teamsPer,
+      groupWinners: {},
+      eliminated: {},
+      previousRankings: {},
+      createdAt: new Date().toISOString(),
+    });
+    setShowImport(false);
+    setImportText("");
+    setImportPreview(null);
+    setImportErr("");
   }
 
   return (
@@ -1036,7 +1254,69 @@ function SetupView({ state, commit, unlocked, tryUnlock, showReveal, resetAll })
             const { parts, assignments } = runDraw(state.parts.map(p => p.name), state.teamsPer);
             commit({ ...state, parts, assignments, groupWinners: {}, eliminated: {}, previousRankings: {}, createdAt: new Date().toISOString() });
           })}>Redraw teams</button>
+          <button className="btn-ghost" onClick={guard(() => setShowImport(v => !v))}>
+            {showImport ? "Cancel import" : "Import draw"}
+          </button>
         </div>
+
+        {showImport && (
+          <div style={{ marginTop: 14 }}>
+            <div className="dim small" style={{ marginBottom: 8 }}>
+              Paste a tab-separated draw table (participant names in column 1, team names in the rest). Copy-paste from Excel or Sheets works directly.
+            </div>
+            <textarea
+              className="inp ta"
+              rows={9}
+              placeholder={"PARTICIPANT\tTIER 1\tTIER 2\t…\nAlex\tFrance 🇫🇷\tUSA 🇺🇸\t…"}
+              value={importText}
+              onChange={e => { setImportText(e.target.value); setImportPreview(null); setImportErr(""); }}
+            />
+            {importErr && (
+              <div className={importPreview ? "warn" : "err"} style={{ whiteSpace: "pre-wrap" }}>
+                {importErr}
+              </div>
+            )}
+            {importPreview && (
+              <div className="import-preview">
+                <div className="import-preview-title">
+                  ✓ {importPreview.parts.length} participants · {importPreview.teamsPer} teams each
+                </div>
+                {importPreview.parts.map(p => (
+                  <div key={p.id} className="import-row">
+                    <span className="import-name">{p.name}</span>
+                    <span className="import-flags">
+                      {(importPreview.assignments[p.id] || []).map(tid => {
+                        const t = TEAM[tid];
+                        return t ? <span key={tid} title={t.name}>{t.flag}</span> : null;
+                      })}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="frow" style={{ marginTop: 12 }}>
+              {!importPreview ? (
+                <button
+                  className="btn-ghost"
+                  style={{ marginTop: 0 }}
+                  onClick={handleParseImport}
+                  disabled={!importText.trim()}
+                >Parse draw</button>
+              ) : (
+                <>
+                  <button className="btn-primary" style={{ marginTop: 0 }} onClick={applyImport}>
+                    Apply this draw
+                  </button>
+                  <button
+                    className="btn-ghost"
+                    style={{ marginTop: 0 }}
+                    onClick={() => { setImportPreview(null); setImportErr(""); }}
+                  >Re-parse</button>
+                </>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="card">
@@ -1340,6 +1620,21 @@ function Styles() {
       .modal-foot     { display: flex; gap: 10px; margin-top: 14px; }
       .modal-share-btn { margin-top: 0; flex: 1; text-align: center; }
       .modal-done-btn  { margin-top: 0; }
+
+      /* mode toggle */
+      .mode-toggle    { display: flex; gap: 8px; margin-bottom: 20px; }
+      .mode-btn       { flex: 1; padding: 12px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; font-size: 14px; font-weight: 600; color: var(--dim); transition: border-color .15s, color .15s; }
+      .mode-btn:hover { border-color: var(--gold); color: var(--chalk); }
+      .mode-btn-on    { border-color: var(--gold); color: var(--gold); background: rgba(233,180,76,0.08); }
+
+      /* import preview */
+      .import-preview       { margin-top: 14px; background: var(--pitch); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+      .import-preview-title { font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #9FE3B4; margin-bottom: 10px; }
+      .import-row           { display: flex; align-items: center; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+      .import-row:last-child { border-bottom: none; }
+      .import-name          { font-weight: 600; min-width: 80px; font-size: 14px; }
+      .import-flags         { display: flex; gap: 3px; flex-wrap: wrap; font-size: 20px; line-height: 1; }
+      .warn                 { color: var(--gold); margin-top: 10px; font-size: 13px; }
 
       @media (max-width: 560px) {
         .score-row { flex-wrap: wrap; }
