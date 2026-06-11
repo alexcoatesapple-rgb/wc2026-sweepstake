@@ -1741,7 +1741,6 @@ function ShareModal({ state, onClose }) {
       if (navigator.share && navigator.canShare?.({ files: [file] })) {
         await navigator.share({ files: [file], title: state.name });
       } else if (navigator.share) {
-        // File sharing unsupported — open the share sheet with the URL so Snapchat etc. still appears
         await navigator.share({ title: state.name, url: window.location.href });
       } else {
         downloadBlob(blob);
