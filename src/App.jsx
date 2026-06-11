@@ -1695,8 +1695,8 @@ function ShareModal({ state, onClose }) {
     [stats.players, state.previousRankings]
   );
 
-  const containerRef = useRef(null);
   const canvasRef    = useRef(null);
+  const [shareImg, setShareImg] = useState(null);
   const [sharing, setSharing] = useState(false);
   const [ready, setReady]     = useState(false);
 
@@ -1705,14 +1705,9 @@ function ShareModal({ state, onClose }) {
     const id = setTimeout(() => {
       const c = buildShareCanvas(stats.players, commentary, state.name, stats.eliminated);
       canvasRef.current = c;
-      c.style.maxWidth    = "100%";
-      c.style.height      = "auto";
-      c.style.display     = "block";
-      c.style.borderRadius = "10px";
-      if (containerRef.current) {
-        containerRef.current.innerHTML = "";
-        containerRef.current.appendChild(c);
-      }
+      // Convert to data URL so React renders a plain <img> — avoids direct DOM
+      // manipulation that breaks React's reconciler on modal close.
+      setShareImg(c.toDataURL("image/png"));
       setReady(true);
     }, 80);
     return () => clearTimeout(id);
@@ -1766,8 +1761,11 @@ function ShareModal({ state, onClose }) {
           <span className="card-title">Matchday Report</span>
           <button className="btn-icon" onClick={handleDone}>✕</button>
         </div>
-        <div ref={containerRef} className="canvas-wrap">
-          {!ready && <div className="canvas-placeholder" />}
+        <div className="canvas-wrap">
+          {shareImg
+            ? <img src={shareImg} alt="Sweepstake standings" style={{ maxWidth: "100%", height: "auto", display: "block", borderRadius: "10px" }} />
+            : <div className="canvas-placeholder" />
+          }
         </div>
         <div className="modal-commentary dim">{commentary}</div>
         <div className="modal-foot">
