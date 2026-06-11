@@ -7,8 +7,6 @@ import { supabase } from "./supabase.js";
    dataset. Organiser PIN gates result entry.
    ============================================================ */
 
-const SWEEP_ID = "wc2026";
-
 const TIERS = ["Favourites", "Contenders", "Dark horses", "Outsiders", "Longshots", "Wild cards"];
 
 const TEAMS = [
@@ -107,27 +105,88 @@ const SCORING_LABELS = {
   cleanSheet: "Clean sheet", redCard: "Red card", groupWin: "Won group", roundWin: "Knockout round won",
 };
 
-/* ---- Supabase storage ---- */
+/* ---- Supabase storage (multi-sweepstake, keyed by view PIN) ----
+   Each sweepstake's row id IS its view PIN — so "type a PIN, see that
+   sweepstake" is a single indexed lookup. The legacy "wc2026" row is
+   still reachable via a fallback scan on data.pin. ---- */
 
-async function loadShared() {
+// Load by view PIN. Tries id match first, then legacy data.pin fallback.
+async function loadByPin(pin) {
+  const key = (pin || "").trim();
+  if (!key) return null;
+  // Primary: row id === view PIN
   const { data, error } = await supabase
     .from("sweepstake")
-    .select("data")
-    .eq("id", SWEEP_ID)
+    .select("id, data")
+    .eq("id", key)
     .maybeSingle();
-  if (error || !data) return null;
-  return data.data;
+  if (!error && data) return { id: data.id, state: data.data };
+  // Fallback: legacy rows where the PIN lived inside data.pin
+  const { data: legacy } = await supabase
+    .from("sweepstake")
+    .select("id, data")
+    .eq("data->>pin", key)
+    .limit(1)
+    .maybeSingle();
+  if (legacy) return { id: legacy.id, state: legacy.data };
+  return null;
 }
 
-async function saveShared(state) {
+// Load a known sweepstake by its row id (used by the switcher / remembered list).
+async function loadById(id) {
+  const { data, error } = await supabase
+    .from("sweepstake")
+    .select("id, data")
+    .eq("id", id)
+    .maybeSingle();
+  if (error || !data) return null;
+  return { id: data.id, state: data.data };
+}
+
+// Does a sweepstake already exist with this view PIN / id?
+async function pinExists(pin) {
+  const hit = await loadByPin(pin);
+  return !!hit;
+}
+
+async function saveSweep(id, state) {
   const { error } = await supabase
     .from("sweepstake")
-    .upsert({ id: SWEEP_ID, data: state, updated_at: new Date().toISOString() });
+    .upsert({ id, data: state, updated_at: new Date().toISOString() });
   return !error;
 }
 
-async function deleteShared() {
-  await supabase.from("sweepstake").delete().eq("id", SWEEP_ID);
+async function deleteSweep(id) {
+  await supabase.from("sweepstake").delete().eq("id", id);
+}
+
+/* ---- device memory: remember unlocked sweepstakes ---- */
+
+const REMEMBER_KEY = "wc26_known_sweeps";
+
+function loadKnownSweeps() {
+  try {
+    const raw = localStorage.getItem(REMEMBER_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+
+// entry: { id, name, viewPin }
+function rememberSweep(entry) {
+  try {
+    const list = loadKnownSweeps().filter(s => s.id !== entry.id);
+    list.unshift(entry);
+    localStorage.setItem(REMEMBER_KEY, JSON.stringify(list.slice(0, 20)));
+  } catch { /* ignore */ }
+}
+
+function forgetSweep(id) {
+  try {
+    const list = loadKnownSweeps().filter(s => s.id !== id);
+    localStorage.setItem(REMEMBER_KEY, JSON.stringify(list));
+  } catch { /* ignore */ }
 }
 
 /* ---- helpers ---- */
@@ -485,65 +544,126 @@ const cls = (...xs) => xs.filter(Boolean).join(" ");
 
 export default function App() {
   const [state, setState]       = useState(null);
-  const [phase, setPhase]       = useState("loading");
+  const [sweepId, setSweepId]   = useState(null);   // row id of the loaded sweepstake
+  const [phase, setPhase]       = useState("landing");
   const [tab, setTab]           = useState("table");
   const [saveStatus, setSave]   = useState("idle");
-  const [unlocked, setUnlocked] = useState(false);
+  const [unlocked, setUnlocked] = useState(false);   // organiser edit unlock
   const [showShare, setShowShare] = useState(false);
+  const [known, setKnown]       = useState([]);
   const saveTimer = useRef(null);
 
+  // On boot: read the remembered list. If the URL has ?s=<id>, try to
+  // auto-open it (it'll already be in the remembered list if this device
+  // has seen it). Otherwise land on the picker.
   useEffect(() => {
-    (async () => {
-      const s = await loadShared();
-      if (s) {
-        setState(s);
-        if (!s.pin) setUnlocked(true);
-        setPhase("main");
-      } else {
-        setPhase("setup");
-      }
-    })();
+    const list = loadKnownSweeps();
+    setKnown(list);
+    const params = new URLSearchParams(window.location.search);
+    const urlId = params.get("s");
+    if (urlId) {
+      (async () => {
+        const hit = await loadById(urlId);
+        if (hit) {
+          openSweep(hit.id, hit.state);
+          return;
+        }
+        setPhase("landing");
+      })();
+    } else {
+      setPhase("landing");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function openSweep(id, st) {
+    setSweepId(id);
+    setState(st);
+    setUnlocked(!st.organiserPin);   // if no organiser PIN, editing is open
+    rememberSweep({ id, name: st.name, viewPin: st.viewPin || id });
+    setKnown(loadKnownSweeps());
+    // reflect in URL so a refresh / shared link reopens it
+    const url = new URL(window.location);
+    url.searchParams.set("s", id);
+    window.history.replaceState({}, "", url);
+    setTab("table");
+    setPhase("main");
+  }
 
   async function commit(next) {
     setState(next);
     setSave("saving");
-    const ok = await saveShared(next);
+    const ok = await saveSweep(sweepId, next);
     setSave(ok ? "saved" : "error");
+    // keep remembered name fresh
+    rememberSweep({ id: sweepId, name: next.name, viewPin: next.viewPin || sweepId });
+    setKnown(loadKnownSweeps());
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => setSave("idle"), 2500);
   }
 
   async function refresh() {
+    if (!sweepId) return;
     setSave("saving");
-    const s = await loadShared();
-    if (s) { setState(s); if (!s.pin) setUnlocked(true); }
+    const hit = await loadById(sweepId);
+    if (hit) { setState(hit.state); if (!hit.state.organiserPin) setUnlocked(true); }
     setSave("idle");
   }
 
   function tryUnlock() {
-    if (!state?.pin) { setUnlocked(true); return; }
-    const guess = window.prompt("Organiser PIN:");
-    if (guess === state.pin) setUnlocked(true);
-    else if (guess !== null) window.alert("Wrong PIN.");
+    if (!state?.organiserPin) { setUnlocked(true); return; }
+    const guess = window.prompt("Organiser PIN (needed to enter results):");
+    if (guess === state.organiserPin) setUnlocked(true);
+    else if (guess !== null) window.alert("Wrong organiser PIN.");
+  }
+
+  function goHome() {
+    const url = new URL(window.location);
+    url.searchParams.delete("s");
+    window.history.replaceState({}, "", url);
+    setSweepId(null);
+    setState(null);
+    setUnlocked(false);
+    setKnown(loadKnownSweeps());
+    setPhase("landing");
   }
 
   return (
     <div className="app">
       <Styles />
       {phase === "loading" && <Splash text="Warming up the floodlights…" />}
-      {phase === "setup" && (
-        <SetupScreen
-          onComplete={async s => { await commit(s); setUnlocked(true); setPhase("reveal"); }}
+
+      {phase === "landing" && (
+        <Landing
+          known={known}
+          onOpen={openSweep}
+          onForget={id => { forgetSweep(id); setKnown(loadKnownSweeps()); }}
+          onCreate={() => setPhase("setup")}
         />
       )}
+
+      {phase === "setup" && (
+        <SetupScreen
+          onCancel={() => setPhase("landing")}
+          onComplete={async (id, s) => {
+            await saveSweep(id, s);
+            openSweep(id, s);
+            setUnlocked(true);
+            setPhase("reveal");
+          }}
+        />
+      )}
+
       {phase === "reveal" && state && (
         <DrawReveal state={state} onDone={() => { setTab("table"); setPhase("main"); }} />
       )}
+
       {phase === "main" && state && (
         <>
           <Main
             state={state}
+            sweepId={sweepId}
+            known={known}
             commit={commit}
             refresh={refresh}
             saveStatus={saveStatus}
@@ -553,11 +673,15 @@ export default function App() {
             tryUnlock={tryUnlock}
             showReveal={() => setPhase("reveal")}
             onMatchdayReport={() => setShowShare(true)}
+            goHome={goHome}
+            switchTo={async id => {
+              const hit = await loadById(id);
+              if (hit) openSweep(hit.id, hit.state);
+            }}
             resetAll={async () => {
-              await deleteShared();
-              setState(null);
-              setUnlocked(false);
-              setPhase("setup");
+              await deleteSweep(sweepId);
+              forgetSweep(sweepId);
+              goHome();
             }}
           />
           {showShare && (
@@ -575,6 +699,77 @@ export default function App() {
   );
 }
 
+/* ---- Landing / sweepstake picker ---- */
+function Landing({ known, onOpen, onForget, onCreate }) {
+  const [pin, setPin]   = useState("");
+  const [err, setErr]   = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function enter() {
+    const key = pin.trim();
+    if (!key) { setErr("Enter a PIN."); return; }
+    setBusy(true); setErr("");
+    const hit = await loadByPin(key);
+    setBusy(false);
+    if (!hit) { setErr("No sweepstake found with that PIN."); return; }
+    onOpen(hit.id, hit.state);
+  }
+
+  return (
+    <div className="setup">
+      <div className="setup-eyebrow">USA · CANADA · MEXICO — SUMMER 2026</div>
+      <h1 className="display setup-title">THE<br />SWEEPSTAKE</h1>
+      <p className="setup-sub">
+        Enter the PIN for your sweepstake to jump in, or start a new one of your own.
+      </p>
+
+      <div className="card">
+        <label className="lbl">Sweepstake PIN</label>
+        <div className="frow" style={{ marginTop: 0 }}>
+          <input
+            className="inp"
+            placeholder="e.g. Family"
+            value={pin}
+            onChange={e => { setPin(e.target.value); setErr(""); }}
+            onKeyDown={e => { if (e.key === "Enter") enter(); }}
+            style={{ flex: 1 }}
+          />
+          <button className="btn-primary" style={{ marginTop: 0 }} onClick={enter} disabled={busy}>
+            {busy ? "…" : "Enter →"}
+          </button>
+        </div>
+        {err && <div className="err">{err}</div>}
+      </div>
+
+      {known.length > 0 && (
+        <div className="card">
+          <div className="card-title">On this device</div>
+          <div className="known-list">
+            {known.map(k => (
+              <div key={k.id} className="known-row">
+                <button className="known-open" onClick={async () => {
+                  const hit = await loadById(k.id);
+                  if (hit) onOpen(hit.id, hit.state);
+                  else onForget(k.id);
+                }}>
+                  <span className="known-name">{k.name || "Untitled sweepstake"}</span>
+                  <span className="known-pin dim">PIN: {k.viewPin}</span>
+                </button>
+                <button className="mini mini-red" title="Forget on this device" onClick={() => onForget(k.id)}>✕</button>
+              </div>
+            ))}
+          </div>
+          <div className="dim small">These are remembered only on this device. Forgetting one doesn't delete it.</div>
+        </div>
+      )}
+
+      <button className="btn-ghost" style={{ width: "100%" }} onClick={onCreate}>
+        + Create a new sweepstake
+      </button>
+    </div>
+  );
+}
+
 /* ---- Splash ---- */
 function Splash({ text }) {
   return (
@@ -586,14 +781,15 @@ function Splash({ text }) {
 }
 
 /* ---- Setup ---- */
-function SetupScreen({ onComplete }) {
+function SetupScreen({ onComplete, onCancel }) {
   const [mode, setMode]         = useState("draw");
-  // random-draw state
   const [name, setName]         = useState("World Cup 2026 Sweepstake");
   const [namesText, setNamesText] = useState("");
   const [teamsPer, setTeamsPer] = useState(null);
-  const [pin, setPin]           = useState("");
+  const [viewPin, setViewPin]       = useState("");
+  const [organiserPin, setOrganiserPin] = useState("");
   const [err, setErr]           = useState("");
+  const [busy, setBusy]         = useState(false);
   // import state
   const [importText, setImportText]     = useState("");
   const [importPreview, setImportPreview] = useState(null);
@@ -604,23 +800,44 @@ function SetupScreen({ onComplete }) {
   const per    = teamsPer && teamsPer <= maxPer ? teamsPer : Math.min(6, maxPer) || 1;
   const used   = names.length * per;
 
-  function go() {
-    if (names.length < 2) { setErr("Add at least two players."); return; }
-    if (names.length > 24) { setErr("24 players max."); return; }
-    const dupes = names.filter((n, i) => names.indexOf(n) !== i);
-    if (dupes.length) { setErr(`Duplicate name: ${dupes[0]}.`); return; }
-    const { parts, assignments } = runDraw(names, per);
-    onComplete({
+  // Shared validation + build, used by both draw and import.
+  async function finalise(buildParts) {
+    const vp = viewPin.trim();
+    if (!vp) { setErr("Set a sweepstake PIN — it's how people get in."); return; }
+    if (vp.length < 3) { setErr("Sweepstake PIN must be at least 3 characters."); return; }
+    if (organiserPin.trim() && organiserPin.trim() === vp) {
+      setErr("Organiser PIN must be different from the sweepstake PIN."); return;
+    }
+    setBusy(true); setErr("");
+    const taken = await pinExists(vp);
+    setBusy(false);
+    if (taken) { setErr("That PIN is already in use. Pick another."); return; }
+
+    const built = buildParts();
+    if (!built) return;
+    const state = {
       name: name.trim() || "World Cup 2026 Sweepstake",
       createdAt: new Date().toISOString(),
-      parts, assignments,
-      teamsPer: per,
+      ...built,
       scoring: { ...DEFAULT_SCORING },
       results: [],
       groupWinners: {},
       eliminated: {},
       previousRankings: {},
-      pin: pin.trim() || null,
+      viewPin: vp,
+      organiserPin: organiserPin.trim() || null,
+    };
+    onComplete(vp, state);   // row id === view PIN
+  }
+
+  function go() {
+    finalise(() => {
+      if (names.length < 2) { setErr("Add at least two players."); return null; }
+      if (names.length > 24) { setErr("24 players max."); return null; }
+      const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+      if (dupes.length) { setErr(`Duplicate name: ${dupes[0]}.`); return null; }
+      const { parts, assignments } = runDraw(names, per);
+      return { parts, assignments, teamsPer: per };
     });
   }
 
@@ -633,29 +850,45 @@ function SetupScreen({ onComplete }) {
   }
 
   function goImport() {
-    if (!importPreview) return;
-    onComplete({
-      name: name.trim() || "World Cup 2026 Sweepstake",
-      createdAt: new Date().toISOString(),
-      parts: importPreview.parts,
-      assignments: importPreview.assignments,
-      teamsPer: importPreview.teamsPer,
-      scoring: { ...DEFAULT_SCORING },
-      results: [],
-      groupWinners: {},
-      eliminated: {},
-      previousRankings: {},
-      pin: pin.trim() || null,
+    finalise(() => {
+      if (!importPreview) { setErr("Parse the draw table first."); return null; }
+      return {
+        parts: importPreview.parts,
+        assignments: importPreview.assignments,
+        teamsPer: importPreview.teamsPer,
+      };
     });
   }
 
+  const PinFields = (
+    <>
+      <label className="lbl">Sweepstake PIN <span className="dim">(people type this to get in)</span></label>
+      <input
+        className="inp"
+        style={{ maxWidth: 220 }}
+        placeholder="e.g. RileyFamily26"
+        value={viewPin}
+        onChange={e => { setViewPin(e.target.value); setErr(""); }}
+      />
+      <label className="lbl">Organiser PIN <span className="dim">(optional — needed to enter results)</span></label>
+      <input
+        className="inp"
+        style={{ maxWidth: 160 }}
+        placeholder="e.g. 2026"
+        value={organiserPin}
+        onChange={e => { setOrganiserPin(e.target.value); setErr(""); }}
+      />
+    </>
+  );
+
   return (
     <div className="setup">
+      <button className="btn-ghost" style={{ marginTop: 0, marginBottom: 18 }} onClick={onCancel}>← Back</button>
       <div className="setup-eyebrow">USA · CANADA · MEXICO — SUMMER 2026</div>
-      <h1 className="display setup-title">THE<br />SWEEPSTAKE</h1>
+      <h1 className="display setup-title">NEW<br />SWEEPSTAKE</h1>
       <p className="setup-sub">
         Names go in, teams come out. A banded draw deals every player one team from each
-        strength band so nobody can moan about the hat.
+        strength band so nobody can moan about the hat. Set a PIN and share it with your group.
       </p>
 
       <div className="mode-toggle">
@@ -703,18 +936,11 @@ function SetupScreen({ onComplete }) {
             </div>
           )}
 
-          <label className="lbl">Organiser PIN <span className="dim">(optional)</span></label>
-          <input
-            className="inp"
-            style={{ maxWidth: 160 }}
-            placeholder="e.g. 2026"
-            value={pin}
-            onChange={e => setPin(e.target.value)}
-          />
+          {PinFields}
 
           {err && <div className="err">{err}</div>}
-          <button className="btn-primary" onClick={go} disabled={names.length < 2}>
-            Run the draw
+          <button className="btn-primary" onClick={go} disabled={names.length < 2 || busy}>
+            {busy ? "Checking PIN…" : "Run the draw"}
           </button>
         </div>
       )}
@@ -724,14 +950,7 @@ function SetupScreen({ onComplete }) {
           <label className="lbl">Sweepstake name</label>
           <input className="inp" value={name} onChange={e => setName(e.target.value)} />
 
-          <label className="lbl">Organiser PIN <span className="dim">(optional)</span></label>
-          <input
-            className="inp"
-            style={{ maxWidth: 160 }}
-            placeholder="e.g. 2026"
-            value={pin}
-            onChange={e => setPin(e.target.value)}
-          />
+          {PinFields}
 
           <label className="lbl">Paste draw table</label>
           <div className="dim small" style={{ marginBottom: 8 }}>
@@ -775,6 +994,8 @@ function SetupScreen({ onComplete }) {
             </div>
           )}
 
+          {err && <div className="err">{err}</div>}
+
           <div className="frow" style={{ marginTop: 16 }}>
             {!importPreview ? (
               <button
@@ -787,8 +1008,8 @@ function SetupScreen({ onComplete }) {
               </button>
             ) : (
               <>
-                <button className="btn-primary" style={{ marginTop: 0 }} onClick={goImport}>
-                  Load this draw →
+                <button className="btn-primary" style={{ marginTop: 0 }} onClick={goImport} disabled={busy}>
+                  {busy ? "Checking PIN…" : "Load this draw →"}
                 </button>
                 <button
                   className="btn-ghost"
@@ -849,16 +1070,17 @@ function DrawReveal({ state, onDone }) {
 
 /* ---- Main shell ---- */
 function Main({
-  state, commit, refresh, saveStatus, tab, setTab,
-  unlocked, tryUnlock, showReveal, onMatchdayReport, resetAll,
+  state, sweepId, known, commit, refresh, saveStatus, tab, setTab,
+  unlocked, tryUnlock, showReveal, onMatchdayReport, resetAll, goHome, switchTo,
 }) {
   const stats = useMemo(() => buildStats(state), [state]);
-  const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["setup","Setup"]];
+  const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["howto","How it works"],["setup","Setup"]];
+  const others = known.filter(k => k.id !== sweepId);
   return (
     <div className="main">
       <header className="hdr">
         <div className="hdr-left">
-          <div className="hdr-badge">WC26</div>
+          <button className="hdr-badge hdr-home" title="All sweepstakes" onClick={goHome}>WC26</button>
           <div>
             <div className="hdr-title">{state.name}</div>
             <div className="hdr-sub">{state.parts.length} players · {state.teamsPer} teams each</div>
@@ -868,6 +1090,19 @@ function Main({
           <span className={cls("savestate", saveStatus)}>
             {saveStatus === "saving" ? "Saving…" : saveStatus === "saved" ? "Saved" : saveStatus === "error" ? "Save failed" : ""}
           </span>
+          {others.length > 0 && (
+            <select
+              className="sweep-switch"
+              value=""
+              onChange={e => { if (e.target.value) switchTo(e.target.value); }}
+              title="Switch sweepstake"
+            >
+              <option value="">Switch ▾</option>
+              {others.map(k => (
+                <option key={k.id} value={k.id}>{k.name || k.viewPin}</option>
+              ))}
+            </select>
+          )}
           <button className="btn-icon" title="Refresh" onClick={refresh}>↻</button>
         </div>
       </header>
@@ -881,13 +1116,87 @@ function Main({
       {tab === "table"   && <TableView   state={state} stats={stats} onMatchdayReport={onMatchdayReport} />}
       {tab === "teams"   && <TeamsView   state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} />}
       {tab === "matches" && <MatchesView state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} />}
+      {tab === "howto"   && <HowItWorks  state={state} stats={stats} />}
       {tab === "setup"   && (
         <SetupView
-          state={state} commit={commit}
+          state={state} commit={commit} sweepId={sweepId}
           unlocked={unlocked} tryUnlock={tryUnlock}
           showReveal={showReveal} resetAll={resetAll}
         />
       )}
+    </div>
+  );
+}
+
+/* ---- How it works ---- */
+function HowItWorks({ state, stats }) {
+  const sc = stats.sc;
+  const scoreRows = [
+    ["Win (group game)", sc.win, "Your team wins a group match."],
+    ["Draw (group game)", sc.draw, "Your team draws a group match."],
+    ["Goal scored", sc.goal, "Per goal your team scores, any stage."],
+    ["Goal conceded", sc.conceded, "Per goal your team lets in, any stage."],
+    ["Clean sheet", sc.cleanSheet, "Your team concedes zero in a match."],
+    ["Red card", sc.redCard, "Per red card your team picks up."],
+    ["Won group", sc.groupWin, "Your team finishes top of its group."],
+    ["Knockout round won", sc.roundWin, "On top of the win points, each KO round your team progresses through."],
+  ];
+  return (
+    <div className="pane">
+      <div className="card">
+        <div className="card-title">The draw</div>
+        <p className="howto-p">
+          Every team at the World Cup is ranked and split into six strength bands — Favourites at the top,
+          down through Contenders, Dark horses, Outsiders, Longshots and Wild cards.
+        </p>
+        <p className="howto-p">
+          The draw deals one team from each band to every player, in turn. So everyone ends up with a
+          balanced spread: a genuine contender, a couple of mid-tier sides, and a few rank outsiders.
+          Nobody gets all the giants, nobody gets all the minnows. No moaning about the hat.
+        </p>
+        <div className="howto-bands">
+          {TIERS.map((t, i) => (
+            <div key={t} className="howto-band">
+              <span className="howto-band-n mono">{i + 1}</span>
+              <span className="howto-band-l">{t}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-title">Scoring</div>
+        <p className="howto-p">
+          You score points from <strong>every team you own</strong>, all the way through the tournament,
+          until they're knocked out. Points keep ticking over in the knockouts too.
+        </p>
+        <div className="howto-score">
+          {scoreRows.map(([label, val, desc]) => (
+            <div key={label} className="howto-score-row">
+              <span className={cls("howto-pts mono", val < 0 && "howto-pts-neg")}>
+                {val > 0 ? `+${val}` : val}
+              </span>
+              <span className="howto-score-label">
+                {label}
+                <span className="howto-score-desc dim">{desc}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+        <p className="howto-p dim small" style={{ marginTop: 14 }}>
+          Note: goals and clean sheets count at every stage, including knockouts. Win points only apply to
+          group games and to the team that wins a knockout tie (penalties count as a win). The organiser
+          can tweak any of these values on the Setup tab — the table recalculates instantly.
+        </p>
+      </div>
+
+      <div className="card">
+        <div className="card-title">Winning</div>
+        <p className="howto-p">
+          Add up the points from all your teams. Most points when the final whistle blows in the final
+          takes the sweepstake. Simple as that.
+        </p>
+      </div>
     </div>
   );
 }
@@ -1164,16 +1473,28 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
 }
 
 /* ---- Setup ---- */
-function SetupView({ state, commit, unlocked, tryUnlock, showReveal, resetAll }) {
+function SetupView({ state, commit, sweepId, unlocked, tryUnlock, showReveal, resetAll }) {
   const [sc, setSc]   = useState({ ...DEFAULT_SCORING, ...(state.scoring || {}) });
-  const [pin, setPin] = useState(state.pin || "");
+  const [orgPin, setOrgPin] = useState(state.organiserPin || "");
+  const [copied, setCopied] = useState(false);
   const [showImport, setShowImport]     = useState(false);
   const [importText, setImportText]     = useState("");
   const [importPreview, setImportPreview] = useState(null);
   const [importErr, setImportErr]       = useState("");
 
+  const viewPin = state.viewPin || sweepId;
+  const shareUrl = `${window.location.origin}${window.location.pathname}?s=${encodeURIComponent(sweepId)}`;
+
   function guard(fn) {
     return () => { if (!unlocked) { tryUnlock(); return; } fn(); };
+  }
+
+  function copyShare() {
+    const msg = `Join my World Cup 2026 sweepstake "${state.name}"!\n\nLink: ${shareUrl}\nPIN: ${viewPin}`;
+    navigator.clipboard?.writeText(msg).then(
+      () => { setCopied(true); setTimeout(() => setCopied(false), 2000); },
+      () => {}
+    );
   }
 
   function handleParseImport() {
@@ -1207,12 +1528,26 @@ function SetupView({ state, commit, unlocked, tryUnlock, showReveal, resetAll })
 
   return (
     <div className="pane">
-      {!unlocked && state.pin && (
+      {!unlocked && state.organiserPin && (
         <div className="notice">
-          Read-only — this sweepstake has an organiser PIN.{" "}
+          Read-only — entering results needs the organiser PIN.{" "}
           <button className="linklike" onClick={tryUnlock}>Unlock</button>
         </div>
       )}
+
+      <div className="card">
+        <div className="card-title">Share this sweepstake</div>
+        <div className="share-pin-row">
+          <span className="dim small">Sweepstake PIN</span>
+          <span className="share-pin mono">{viewPin}</span>
+        </div>
+        <div className="dim small" style={{ margin: "8px 0 12px" }}>
+          Send people the link and PIN. They enter the PIN on the home screen to view the table.
+        </div>
+        <button className="btn-primary" style={{ marginTop: 0 }} onClick={copyShare}>
+          {copied ? "✓ Copied" : "📋 Copy invite (link + PIN)"}
+        </button>
+      </div>
 
       <div className="card">
         <div className="card-title">Scoring</div>
@@ -1324,14 +1659,18 @@ function SetupView({ state, commit, unlocked, tryUnlock, showReveal, resetAll })
         <div className="frow">
           <input
             className="inp" style={{ maxWidth: 160 }}
-            placeholder="No PIN set" value={pin}
-            onChange={e => setPin(e.target.value)}
+            placeholder="No PIN set" value={orgPin}
+            onChange={e => setOrgPin(e.target.value)}
           />
-          <button className="btn-ghost" onClick={guard(() => commit({ ...state, pin: pin.trim() || null }))}>
-            {pin.trim() ? "Set PIN" : "Remove PIN"}
+          <button className="btn-ghost" onClick={guard(() => {
+            const v = orgPin.trim();
+            if (v && v === viewPin) { window.alert("Organiser PIN must differ from the sweepstake PIN."); return; }
+            commit({ ...state, organiserPin: v || null });
+          })}>
+            {orgPin.trim() ? "Set PIN" : "Remove PIN"}
           </button>
         </div>
-        <div className="dim small">With a PIN, anyone can view but only the organiser can enter results.</div>
+        <div className="dim small">With an organiser PIN, anyone with the sweepstake PIN can view, but only the organiser can enter results.</div>
       </div>
 
       <div className="card card-danger">
@@ -1342,7 +1681,7 @@ function SetupView({ state, commit, unlocked, tryUnlock, showReveal, resetAll })
       </div>
 
       <div className="dim small" style={{ padding: "0 4px" }}>
-        Everyone who opens this URL shares the same live data. Share the link, the table updates for all.
+        Everyone who enters this sweepstake's PIN shares the same live data. Share the PIN, the table updates for all.
       </div>
     </div>
   );
@@ -1635,6 +1974,37 @@ function Styles() {
       .import-name          { font-weight: 600; min-width: 80px; font-size: 14px; }
       .import-flags         { display: flex; gap: 3px; flex-wrap: wrap; font-size: 20px; line-height: 1; }
       .warn                 { color: var(--gold); margin-top: 10px; font-size: 13px; }
+
+      /* landing / known list */
+      .known-list     { display: flex; flex-direction: column; gap: 6px; }
+      .known-row      { display: flex; align-items: center; gap: 8px; }
+      .known-open     { flex: 1; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; background: var(--pitch); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; text-align: left; }
+      .known-open:hover { border-color: var(--gold); }
+      .known-name     { font-weight: 600; }
+      .known-pin      { font-size: 12px; }
+
+      /* switcher */
+      .hdr-home       { border: none; cursor: pointer; }
+      .hdr-home:hover { background: #f4c763; }
+      .sweep-switch   { background: var(--panel); border: 1px solid var(--line); color: var(--chalk); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 13px; max-width: 130px; }
+
+      /* share card */
+      .share-pin-row  { display: flex; align-items: center; justify-content: space-between; background: var(--pitch); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+      .share-pin      { font-size: 20px; font-weight: 700; color: var(--gold); letter-spacing: .02em; }
+
+      /* how it works */
+      .howto-p        { margin-bottom: 12px; line-height: 1.6; }
+      .howto-p:last-child { margin-bottom: 0; }
+      .howto-bands    { display: flex; flex-direction: column; gap: 5px; margin-top: 6px; }
+      .howto-band     { display: flex; align-items: center; gap: 12px; background: var(--pitch); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; }
+      .howto-band-n   { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; background: var(--gold); color: var(--pitch); border-radius: 5px; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+      .howto-band-l   { font-weight: 600; }
+      .howto-score    { display: flex; flex-direction: column; gap: 6px; }
+      .howto-score-row { display: flex; align-items: flex-start; gap: 12px; background: var(--pitch); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+      .howto-pts      { min-width: 42px; font-size: 17px; font-weight: 700; color: var(--win); flex-shrink: 0; }
+      .howto-pts-neg  { color: var(--signal); }
+      .howto-score-label { display: flex; flex-direction: column; gap: 2px; font-weight: 600; }
+      .howto-score-desc { font-weight: 400; font-size: 12.5px; }
 
       @media (max-width: 560px) {
         .score-row { flex-wrap: wrap; }
