@@ -1729,19 +1729,28 @@ function ShareModal({ state, onClose }) {
     const c = canvasRef.current;
     if (!c || !ready) return;
     setSharing(true);
-    c.toBlob(async blob => {
+    let blob = null;
+    try {
+      blob = await new Promise((resolve, reject) => {
+        c.toBlob(
+          b => b ? resolve(b) : reject(new Error("Canvas export returned null.")),
+          "image/png"
+        );
+      });
       const file = new File([blob], "sweepstake-standings.png", { type: "image/png" });
-      if (navigator.canShare?.({ files: [file] })) {
-        try {
-          await navigator.share({ files: [file], title: state.name });
-        } catch (e) {
-          if (e.name !== "AbortError") downloadBlob(blob);
-        }
+      if (navigator.share && navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: state.name });
+      } else if (navigator.share) {
+        // File sharing unsupported — open the share sheet with the URL so Snapchat etc. still appears
+        await navigator.share({ title: state.name, url: window.location.href });
       } else {
         downloadBlob(blob);
       }
+    } catch (e) {
+      if (e.name !== "AbortError" && blob) downloadBlob(blob);
+    } finally {
       setSharing(false);
-    }, "image/png");
+    }
   }
 
   function downloadBlob(blob) {
