@@ -95,11 +95,11 @@ function parseResultsText(text, existingResults = []) {
   for (const line of lines) {
     if (/^[#/]/.test(line)) continue;
     const m = line.match(
-      /^(GROUP|R32|R16|QF|SF|THIRD|FINAL):\s*(.+?)\s+(\d+)-(\d+)\s+(.+?)(?:\s*\(pens:\s*(.+?)\))?\s*$/i
+      /^(GROUP|R32|R16|QF|SF|THIRD|FINAL):\s*(.+?)\s+(\d+)-(\d+)\s+(.+?)(?:\s*\(pens:\s*(.+?)\))?(?:\s+reds:(\d+)-(\d+))?\s*$/i
     );
     if (!m) { errors.push(`Couldn't parse: "${line}"`); continue; }
 
-    const [, stage, rawA, scoreA, scoreB, rawB, rawPens] = m;
+    const [, stage, rawA, scoreA, scoreB, rawB, rawPens, rawRedsA, rawRedsB] = m;
     const teamA = findTeamId(rawA.trim());
     const teamB = findTeamId(rawB.trim());
 
@@ -137,7 +137,8 @@ function parseResultsText(text, existingResults = []) {
       id: 'imp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
       stage: stageUp, teamA, teamB,
       scoreA: sA, scoreB: sB,
-      redsA: 0, redsB: 0,
+      redsA: rawRedsA ? parseInt(rawRedsA, 10) : 0,
+      redsB: rawRedsB ? parseInt(rawRedsB, 10) : 0,
       pensWinner: isKo && sA === sB ? pensWinner : null,
       at: new Date().toISOString(),
     });
@@ -1564,10 +1565,13 @@ R16: Argentina 1-1 England (pens: Argentina)`}
                         <div key={m.id} className="import-row">
                           <span className="mstage mono">{STAGE[m.stage].short}</span>
                           <span style={{ flex: 1 }}>
-                            {A.flag} {A.name} <strong className="mono">{m.scoreA}\u2013{m.scoreB}</strong> {B.name} {B.flag}
+                            {A.flag} {A.name} <strong className="mono">{m.scoreA}–{m.scoreB}</strong> {B.name} {B.flag}
                           </span>
                           {m.pensWinner && (
                             <span className="dim" style={{ fontSize: 12 }}>pens: {TEAM[m.pensWinner]?.name}</span>
+                          )}
+                          {(m.redsA > 0 || m.redsB > 0) && (
+                            <span className="dim" style={{ fontSize: 12 }}>🟥 {m.redsA}-{m.redsB}</span>
                           )}
                         </div>
                       );
@@ -1576,7 +1580,7 @@ R16: Argentina 1-1 England (pens: Argentina)`}
                 )}
                 {pastePreview.dupes.length > 0 && (
                   <div className="warn" style={{ marginTop: 8 }}>
-                    Already logged \u2014 skipped: {pastePreview.dupes.join(", ")}
+                    Already logged — skipped: {pastePreview.dupes.join(", ")}
                   </div>
                 )}
                 {pastePreview.errors.length > 0 && (
