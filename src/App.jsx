@@ -86,6 +86,66 @@ function parseDrawTable(text) {
   return { parts, assignments, teamsPer, errors };
 }
 
+function parseResultsText(text, existingResults = []) {
+  const lines = text.trim().split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const parsed = [];
+  const errors = [];
+  const dupes  = [];
+
+  for (const line of lines) {
+    if (/^[#/]/.test(line)) continue;
+    const m = line.match(
+      /^(GROUP|R32|R16|QF|SF|THIRD|FINAL):\s*(.+?)\s+(\d+)-(\d+)\s+(.+?)(?:\s*\(pens:\s*(.+?)\))?\s*$/i
+    );
+    if (!m) { errors.push(`Couldn't parse: "${line}"`); continue; }
+
+    const [, stage, rawA, scoreA, scoreB, rawB, rawPens] = m;
+    const teamA = findTeamId(rawA.trim());
+    const teamB = findTeamId(rawB.trim());
+
+    if (!teamA) { errors.push(`Team not recognised: "${rawA.trim()}"`); continue; }
+    if (!teamB) { errors.push(`Team not recognised: "${rawB.trim()}"`); continue; }
+
+    const stageUp = stage.toUpperCase();
+    const isKo    = STAGE[stageUp]?.ko;
+    const sA      = parseInt(scoreA, 10);
+    const sB      = parseInt(scoreB, 10);
+
+    let pensWinner = null;
+    if (rawPens) {
+      const pid = findTeamId(rawPens.trim());
+      if (pid) pensWinner = pid;
+      else errors.push(`Pens winner not recognised: "${rawPens.trim()}"`);
+    }
+
+    if (isKo && sA === sB && !pensWinner) {
+      errors.push(`Knockout draw needs a pens winner: "${line}"`);
+      continue;
+    }
+
+    const isDupe = existingResults.some(e =>
+      e.stage === stageUp &&
+      ((e.teamA === teamA && e.teamB === teamB) ||
+       (e.teamA === teamB && e.teamB === teamA))
+    );
+    if (isDupe) {
+      dupes.push(`${TEAM[teamA]?.name} v ${TEAM[teamB]?.name} (${STAGE[stageUp]?.short})`);
+      continue;
+    }
+
+    parsed.push({
+      id: 'imp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+      stage: stageUp, teamA, teamB,
+      scoreA: sA, scoreB: sB,
+      redsA: 0, redsB: 0,
+      pensWinner: isKo && sA === sB ? pensWinner : null,
+      at: new Date().toISOString(),
+    });
+  }
+
+  return { parsed, errors, dupes };
+}
+
 const STAGES = [
   { id: "GROUP", label: "Group stage",    short: "GRP", ko: false },
   { id: "R32",   label: "Round of 32",    short: "R32", ko: true  },
@@ -1322,6 +1382,9 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
   const [form, setForm]       = useState(EMPTY_FORM);
   const [editing, setEditing] = useState(null);
   const [err, setErr]         = useState("");
+  const [showPaste, setShowPaste]       = useState(false);
+  const [pasteText, setPasteText]       = useState("");
+  const [pastePreview, setPastePreview] = useState(null);
 
   const owned   = TEAMS.filter(t =>  stats.ownedTeams.has(t.id));
   const unowned = TEAMS.filter(t => !stats.ownedTeams.has(t.id));
@@ -1368,6 +1431,19 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
     if (!unlocked) { tryUnlock(); return; }
     if (!window.confirm("Delete this result?")) return;
     commit({ ...state, results: state.results.filter(m => m.id !== id) });
+  }
+
+  function handleParsePaste() {
+    setPastePreview(parseResultsText(pasteText, state.results));
+  }
+
+  function applyPaste() {
+    if (!unlocked) { tryUnlock(); return; }
+    if (!pastePreview?.parsed?.length) return;
+    commit({ ...state, results: [...state.results, ...pastePreview.parsed] });
+    setShowPaste(false);
+    setPasteText("");
+    setPastePreview(null);
   }
 
   const TeamSelect = ({ value, onChange, exclude }) => (
@@ -1445,6 +1521,98 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
             </button>
           )}
         </div>
+      </div>
+
+      <div className="card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div className="card-title" style={{ marginBottom: 0 }}>Paste results</div>
+          <button
+            className="btn-ghost"
+            style={{ marginTop: 0, padding: "5px 12px", fontSize: 13 }}
+            onClick={() => { setShowPaste(v => !v); setPastePreview(null); setPasteText(""); }}
+          >
+            {showPaste ? "Close" : "Open"}
+          </button>
+        </div>
+        {showPaste && (
+          <>
+            <div className="dim small" style={{ marginTop: 10, marginBottom: 8 }}>
+              One result per line:
+              <pre style={{ marginTop: 6, background: "var(--pitch)", padding: "8px 10px", borderRadius: 7, fontSize: 12, color: "var(--chalk)", lineHeight: 1.6, overflowX: "auto", whiteSpace: "pre" }}>
+{`GROUP: Spain 2-1 France
+GROUP: USA 0-0 Mexico
+R16: Argentina 1-1 England (pens: Argentina)`}
+              </pre>
+            </div>
+            <textarea
+              className="inp ta"
+              rows={5}
+              placeholder={"GROUP: Spain 2-1 France\nGROUP: USA 0-0 Mexico"}
+              value={pasteText}
+              onChange={e => { setPasteText(e.target.value); setPastePreview(null); }}
+            />
+            {pastePreview && (
+              <div style={{ marginTop: 12 }}>
+                {pastePreview.parsed.length > 0 && (
+                  <div className="import-preview">
+                    <div className="import-preview-title">
+                      ✓ {pastePreview.parsed.length} result{pastePreview.parsed.length !== 1 ? "s" : ""} ready
+                    </div>
+                    {pastePreview.parsed.map(m => {
+                      const A = TEAM[m.teamA], B = TEAM[m.teamB];
+                      return (
+                        <div key={m.id} className="import-row">
+                          <span className="mstage mono">{STAGE[m.stage].short}</span>
+                          <span style={{ flex: 1 }}>
+                            {A.flag} {A.name} <strong className="mono">{m.scoreA}\u2013{m.scoreB}</strong> {B.name} {B.flag}
+                          </span>
+                          {m.pensWinner && (
+                            <span className="dim" style={{ fontSize: 12 }}>pens: {TEAM[m.pensWinner]?.name}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {pastePreview.dupes.length > 0 && (
+                  <div className="warn" style={{ marginTop: 8 }}>
+                    Already logged \u2014 skipped: {pastePreview.dupes.join(", ")}
+                  </div>
+                )}
+                {pastePreview.errors.length > 0 && (
+                  <div className="err" style={{ marginTop: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
+                    {pastePreview.errors.join("\n")}
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="frow" style={{ marginTop: 14 }}>
+              {!pastePreview ? (
+                <button
+                  className="btn-primary"
+                  style={{ marginTop: 0 }}
+                  onClick={handleParsePaste}
+                  disabled={!pasteText.trim()}
+                >
+                  Parse
+                </button>
+              ) : pastePreview.parsed.length > 0 ? (
+                <>
+                  <button className="btn-primary" style={{ marginTop: 0 }} onClick={applyPaste}>
+                    Import {pastePreview.parsed.length} result{pastePreview.parsed.length !== 1 ? "s" : ""}
+                  </button>
+                  <button className="btn-ghost" style={{ marginTop: 0 }} onClick={() => setPastePreview(null)}>
+                    Re-parse
+                  </button>
+                </>
+              ) : (
+                <button className="btn-ghost" style={{ marginTop: 0 }} onClick={() => setPastePreview(null)}>
+                  Try again
+                </button>
+              )}
+            </div>
+          </>
+        )}
       </div>
 
       <div className="mlist">
