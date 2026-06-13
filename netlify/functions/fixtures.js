@@ -30,11 +30,16 @@ exports.handler = async (event) => {
 
   const params = event.queryStringParameters || {};
 
+  // Default from/to to yesterday and today if not provided
+  const formatDate = (d) => d.toISOString().split("T")[0];
+  const today = new Date();
+  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+
   // Support filtering by status (FT, LIVE, NS etc.) or date range
   if (params.status) url.searchParams.set("status", params.status);
   if (params.date)   url.searchParams.set("date",   params.date);
-  if (params.from)   url.searchParams.set("from",   params.from);
-  if (params.to)     url.searchParams.set("to",     params.to);
+  url.searchParams.set("from", params.from || formatDate(yesterday));
+  url.searchParams.set("to",   params.to   || formatDate(today));
   if (params.round)  url.searchParams.set("round",  params.round);
 
   try {
