@@ -158,6 +158,61 @@ const STAGES = [
 ];
 const STAGE = Object.fromEntries(STAGES.map(s => [s.id, s]));
 
+/* ---- API-Football name → internal team id ---- */
+const API_TEAM_MAP = {
+  "Spain":"esp","France":"fra","England":"eng","Argentina":"arg","Brazil":"bra",
+  "Portugal":"por","Germany":"ger","Netherlands":"ned","Belgium":"bel","Norway":"nor",
+  "Morocco":"mar","Colombia":"col","USA":"usa","United States":"usa","Uruguay":"uru",
+  "Japan":"jpn","Mexico":"mex","Croatia":"cro","Switzerland":"sui","Ecuador":"ecu",
+  "Senegal":"sen","Korea Republic":"kor","South Korea":"kor","Turkiye":"tur",
+  "Türkiye":"tur","Turkey":"tur","Canada":"can","Austria":"aut","Sweden":"swe",
+  "Ivory Coast":"civ","Cote d'Ivoire":"civ","Côte d'Ivoire":"civ","Czechia":"cze",
+  "Czech Republic":"cze","Scotland":"sco","Australia":"aus","Paraguay":"par",
+  "Iran":"irn","Bosnia":"bih","Bosnia and Herzegovina":"bih","Saudi Arabia":"ksa",
+  "Tunisia":"tun","Ghana":"gha","Egypt":"egy","Algeria":"alg","Uzbekistan":"uzb",
+  "DR Congo":"cod","Congo DR":"cod","New Zealand":"nzl","Cape Verde":"cpv",
+  "Jordan":"jor","South Africa":"rsa","Panama":"pan","Iraq":"irq","Qatar":"qat",
+  "Curacao":"cuw","Curaçao":"cuw","Haiti":"hai",
+};
+function apiTeamId(name) { return API_TEAM_MAP[name] || null; }
+
+function apiRoundToStage(round) {
+  if (!round) return "GROUP";
+  const r = round.toLowerCase();
+  if (r.includes("group"))           return "GROUP";
+  if (r.includes("32") || r.includes("round of 32")) return "R32";
+  if (r.includes("16") || r.includes("round of 16")) return "R16";
+  if (r.includes("quarter"))         return "QF";
+  if (r.includes("semi"))            return "SF";
+  if (r.includes("third") || r.includes("3rd") || r.includes("place")) return "THIRD";
+  if (r.includes("final"))           return "FINAL";
+  return "GROUP";
+}
+
+function apiFixturesToPasteText(fixtures) {
+  return fixtures.map(f => {
+    const { fixture, teams, goals, score } = f;
+    const stageId = apiRoundToStage(f.league?.round);
+    const stage   = STAGE[stageId]?.short || "GROUP";
+    const hName   = teams.home.name;
+    const aName   = teams.away.name;
+    const hId     = apiTeamId(hName);
+    const aId     = apiTeamId(aName);
+    if (!hId || !aId) return null;           // skip unknown teams
+    const hScore  = goals.home ?? 0;
+    const aScore  = goals.away ?? 0;
+    const isPens  = score?.penalty?.home != null;
+    const pensWin = isPens
+      ? (score.penalty.home > score.penalty.away ? hId : aId)
+      : null;
+    const hName2  = TEAM[hId]?.name || hName;
+    const aName2  = TEAM[aId]?.name || aName;
+    let line = `${stageId}: ${hName2} ${hScore}-${aScore} ${aName2}`;
+    if (pensWin) line += ` (pens: ${TEAM[pensWin]?.name || pensWin})`;
+    return line;
+  }).filter(Boolean).join("\n");
+}
+
 const DEFAULT_SCORING = {
   win: 5, draw: 2, goal: 1, conceded: -1, cleanSheet: 2, redCard: -3, groupWin: 3, roundWin: 5,
 };
@@ -1379,6 +1434,119 @@ const EMPTY_FORM = {
   scoreA: "", scoreB: "", redsA: 0, redsB: 0, pensWinner: "",
 };
 
+/* ---- Live Scores Panel ---- */
+function LiveScoresPanel({ state, onImport }) {
+  const [open, setOpen]       = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError]     = useState("");
+  const [fixtures, setFixtures] = useState([]);
+
+  async function fetchScores() {
+    setLoading(true); setError(""); setFixtures([]);
+    try {
+      const today = new Date();
+      const pad   = n => String(n).padStart(2, "0");
+      const fmt   = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+      const from  = fmt(new Date(today - 3 * 86400000));
+      const to    = fmt(today);
+      const res   = await fetch(`/.netlify/functions/fixtures?status=FT&from=${from}&to=${to}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data  = await res.json();
+      if (data.error) throw new Error(data.error);
+      setFixtures(data.response || []);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function toggle() {
+    if (!open) fetchScores();
+    setOpen(v => !v);
+  }
+
+  const existingPairs = new Set(
+    state.results.map(m => [m.teamA, m.teamB].sort().join("|"))
+  );
+  const newFixtures = fixtures.filter(f => {
+    const hId = apiTeamId(f.teams.home.name);
+    const aId = apiTeamId(f.teams.away.name);
+    if (!hId || !aId) return false;
+    return !existingPairs.has([hId, aId].sort().join("|"));
+  });
+
+  function importAll() {
+    const text = apiFixturesToPasteText(newFixtures);
+    if (text) onImport(text);
+  }
+
+  return (
+    <div className="card">
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div className="card-title" style={{ marginBottom:0 }}>
+          <span className="ls-dot" /> Live Scores
+        </div>
+        <button
+          className="btn-ghost"
+          style={{ marginTop:0, padding:"5px 12px", fontSize:13 }}
+          onClick={toggle}
+        >
+          {open ? "Hide" : "Show"}
+        </button>
+      </div>
+
+      {open && (
+        <div style={{ marginTop:12 }}>
+          {loading && <div className="dim small">Fetching results…</div>}
+          {error   && <div className="err" style={{ marginTop:8 }}>{error}</div>}
+          {!loading && !error && fixtures.length === 0 && (
+            <div className="dim small">No finished matches found in the last 3 days.</div>
+          )}
+          {!loading && fixtures.length > 0 && (
+            <>
+              {fixtures.map(f => {
+                const hId  = apiTeamId(f.teams.home.name);
+                const aId  = apiTeamId(f.teams.away.name);
+                const hT   = hId ? TEAM[hId] : { name: f.teams.home.name, flag: "🏳" };
+                const aT   = aId ? TEAM[aId] : { name: f.teams.away.name, flag: "🏳" };
+                const isNew = hId && aId && !existingPairs.has([hId,aId].sort().join("|"));
+                return (
+                  <div key={f.fixture.id} className="ls-row">
+                    <span className="mstage mono" style={{ fontSize:11 }}>
+                      {apiRoundToStage(f.league?.round).replace("GROUP","GRP")}
+                    </span>
+                    <span className="ls-teams">
+                      {hT.flag} {hT.name}{" "}
+                      <strong className="mono">{f.goals.home}–{f.goals.away}</strong>{" "}
+                      {aT.name} {aT.flag}
+                    </span>
+                    {isNew && <span className="ls-new">new</span>}
+                  </div>
+                );
+              })}
+              {newFixtures.length > 0 && (
+                <button
+                  className="btn-primary"
+                  style={{ marginTop:12 }}
+                  onClick={importAll}
+                >
+                  Import {newFixtures.length} new result{newFixtures.length !== 1 ? "s" : ""} into paste box
+                </button>
+              )}
+              {newFixtures.length === 0 && (
+                <div className="dim small" style={{ marginTop:8 }}>
+                  All fetched results are already logged ✓
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
   const [form, setForm]       = useState(EMPTY_FORM);
   const [editing, setEditing] = useState(null);
@@ -1438,6 +1606,12 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
     setPastePreview(parseResultsText(pasteText, state.results));
   }
 
+  function handleLiveImport(text) {
+    setShowPaste(true);
+    setPasteText(text);
+    setPastePreview(parseResultsText(text, state.results));
+  }
+
   function applyPaste() {
     if (!unlocked) { tryUnlock(); return; }
     if (!pastePreview?.parsed?.length) return;
@@ -1469,6 +1643,7 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
 
   return (
     <div className="pane">
+      <LiveScoresPanel state={state} onImport={handleLiveImport} />
       <div className="card">
         <div className="card-title">{editing ? "Edit result" : "Add result"}</div>
         <div className="frow">
@@ -2183,6 +2358,14 @@ function Styles() {
       .howto-pts-neg  { color: var(--signal); }
       .howto-score-label { display: flex; flex-direction: column; gap: 2px; font-weight: 600; }
       .howto-score-desc { font-weight: 400; font-size: 12.5px; }
+
+      /* live scores panel */
+      .ls-dot       { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--win); margin-right: 6px; vertical-align: middle; animation: ls-pulse 1.4s ease-in-out infinite; }
+      @keyframes ls-pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+      .ls-row       { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line); }
+      .ls-row:last-of-type { border-bottom: none; }
+      .ls-teams     { flex: 1; font-size: 13.5px; }
+      .ls-new       { background: var(--gold); color: var(--pitch); border-radius: 5px; font-size: 11px; font-weight: 700; padding: 2px 6px; flex-shrink: 0; }
 
       @media (max-width: 560px) {
         .score-row { flex-wrap: wrap; }
