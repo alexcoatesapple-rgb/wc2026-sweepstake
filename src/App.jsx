@@ -1319,12 +1319,30 @@ function HowItWorks({ state, stats }) {
                 </button>
                 {isOpen && (
                   <div className="howto-band-teams">
-                    {tierTeams.map(tm => (
-                      <span key={tm.id} className="howto-band-team">
-                        <span>{tm.flag}</span>
-                        <span>{tm.name}</span>
-                      </span>
-                    ))}
+                    {[...tierTeams]
+                      .sort((a, b) => {
+                        const pa = stats.teamPts[a.id] ?? null;
+                        const pb = stats.teamPts[b.id] ?? null;
+                        if (pa !== null && pb !== null) return pb - pa;
+                        if (pa !== null) return -1;
+                        if (pb !== null) return 1;
+                        return 0;
+                      })
+                      .map(tm => {
+                        const pts = stats.teamPts[tm.id];
+                        const owned = pts !== undefined;
+                        const out = stats.eliminated.has(tm.id);
+                        return (
+                          <span key={tm.id} className={cls("howto-band-team", out && "chip-out")}>
+                            <span>{tm.flag}</span>
+                            <span>{tm.name}</span>
+                            {owned && (
+                              <span className="howto-band-pts mono">{pts}</span>
+                            )}
+                          </span>
+                        );
+                      })
+                    }
                   </div>
                 )}
               </div>
@@ -2415,6 +2433,7 @@ function Styles() {
       .howto-band-count { font-size: 12px; }
       .howto-band-teams { display: flex; flex-wrap: wrap; gap: 6px; background: var(--panel-2); border: 1px solid var(--gold-dk); border-top: none; border-radius: 0 0 8px 8px; padding: 10px 12px; }
       .howto-band-team  { display: flex; align-items: center; gap: 5px; background: var(--pitch); border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; font-size: 13px; font-weight: 500; }
+      .howto-band-pts   { color: var(--gold); font-weight: 700; font-size: 12px; margin-left: 2px; }
       .howto-score    { display: flex; flex-direction: column; gap: 6px; }
       .howto-score-row { display: flex; align-items: flex-start; gap: 12px; background: var(--pitch); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
       .howto-pts      { min-width: 42px; font-size: 17px; font-weight: 700; color: var(--win); flex-shrink: 0; }
