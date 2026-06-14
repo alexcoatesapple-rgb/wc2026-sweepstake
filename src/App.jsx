@@ -7,7 +7,7 @@ import { supabase } from "./supabase.js";
    dataset. Organiser PIN gates result entry.
    ============================================================ */
 
-const TIERS = ["Favourites", "Contenders", "Dark horses", "Outsiders", "Longshots", "Wild cards"];
+const TIERS = ["Favourites", "Dark Horses", "Outsiders", "Passengers", "Cannon Fodder", "Tourists"];
 
 const TEAMS = [
   ["esp","Spain","🇪🇸"],["fra","France","🇫🇷"],["eng","England","🏴󠁧󠁢󠁥󠁮󠁧󠁿"],
@@ -718,6 +718,36 @@ export default function App() {
     saveTimer.current = setTimeout(() => setSave("idle"), 2500);
   }
 
+  // Adds new results to the current sweep AND silently syncs them to all other
+  // sweepstakes remembered on this device. Edits/deletions stay scoped to the
+  // current sweep — only brand-new results are broadcast.
+  async function addResultsToAll(newResults) {
+    if (!newResults || newResults.length === 0) return;
+    // 1. Update current sweep
+    const nextState = { ...state, results: [...state.results, ...newResults] };
+    await commit(nextState);
+    // 2. Sync to every other sweep on this device
+    const others = known.filter(k => k.id !== sweepId);
+    for (const sweep of others) {
+      try {
+        const hit = await loadById(sweep.id);
+        if (!hit) continue;
+        const existing = hit.state.results || [];
+        const toAdd = newResults.filter(nr =>
+          !existing.some(er =>
+            er.stage === nr.stage &&
+            ((er.teamA === nr.teamA && er.teamB === nr.teamB) ||
+             (er.teamA === nr.teamB && er.teamB === nr.teamA))
+          )
+        );
+        if (!toAdd.length) continue;
+        await saveSweep(sweep.id, { ...hit.state, results: [...existing, ...toAdd] });
+      } catch (e) {
+        console.warn('Could not sync results to sweep', sweep.id, e);
+      }
+    }
+  }
+
   async function refresh() {
     if (!sweepId) return;
     setSave("saving");
@@ -790,6 +820,7 @@ export default function App() {
             showReveal={() => setPhase("reveal")}
             onMatchdayReport={() => setShowShare(true)}
             goHome={goHome}
+            addResultsToAll={addResultsToAll}
             switchTo={async id => {
               const hit = await loadById(id);
               if (hit) openSweep(hit.id, hit.state);
@@ -1187,7 +1218,7 @@ function DrawReveal({ state, onDone }) {
 /* ---- Main shell ---- */
 function Main({
   state, sweepId, known, commit, refresh, saveStatus, tab, setTab,
-  unlocked, tryUnlock, showReveal, onMatchdayReport, resetAll, goHome, switchTo,
+  unlocked, tryUnlock, showReveal, onMatchdayReport, resetAll, goHome, switchTo, addResultsToAll,
 }) {
   const stats = useMemo(() => buildStats(state), [state]);
   const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["howto","How it works"],["setup","Setup"]];
@@ -1231,7 +1262,7 @@ function Main({
       </nav>
       {tab === "table"   && <TableView   state={state} stats={stats} onMatchdayReport={onMatchdayReport} />}
       {tab === "teams"   && <TeamsView   state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} />}
-      {tab === "matches" && <MatchesView state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} />}
+      {tab === "matches" && <MatchesView state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} addResultsToAll={addResultsToAll} />}
       {tab === "howto"   && <HowItWorks  state={state} stats={stats} />}
       {tab === "setup"   && (
         <SetupView
@@ -1246,6 +1277,7 @@ function Main({
 
 /* ---- How it works ---- */
 function HowItWorks({ state, stats }) {
+  const [openTier, setOpenTier] = useState(null);
   const sc = stats.sc;
   const scoreRows = [
     ["Win (group game)", sc.win, "Your team wins a group match."],
@@ -1271,12 +1303,33 @@ function HowItWorks({ state, stats }) {
           Nobody gets all the giants, nobody gets all the minnows. No moaning about the hat.
         </p>
         <div className="howto-bands">
-          {TIERS.map((t, i) => (
-            <div key={t} className="howto-band">
-              <span className="howto-band-n mono">{i + 1}</span>
-              <span className="howto-band-l">{t}</span>
-            </div>
-          ))}
+          {TIERS.map((t, i) => {
+            const tierTeams = TEAMS.filter(tm => tm.tier === i);
+            const isOpen = openTier === i;
+            return (
+              <div key={t} className="howto-band-wrap">
+                <button
+                  className={cls("howto-band", isOpen && "howto-band-open")}
+                  onClick={() => setOpenTier(isOpen ? null : i)}
+                >
+                  <span className="howto-band-n mono">{i + 1}</span>
+                  <span className="howto-band-l">{t}</span>
+                  <span className="howto-band-count dim">{tierTeams.length} teams</span>
+                  <span className={cls("chev", isOpen && "chev-open")}>▾</span>
+                </button>
+                {isOpen && (
+                  <div className="howto-band-teams">
+                    {tierTeams.map(tm => (
+                      <span key={tm.id} className="howto-band-team">
+                        <span>{tm.flag}</span>
+                        <span>{tm.name}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -1547,7 +1600,7 @@ function LiveScoresPanel({ state, onImport }) {
   );
 }
 
-function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
+function MatchesView({ state, stats, commit, unlocked, tryUnlock, addResultsToAll }) {
   const [form, setForm]       = useState(EMPTY_FORM);
   const [editing, setEditing] = useState(null);
   const [err, setErr]         = useState("");
@@ -1578,10 +1631,14 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
       pensWinner: stage.ko && a === b ? form.pensWinner : null,
       at: new Date().toISOString(),
     };
-    const results = editing
-      ? state.results.map(m => (m.id === editing ? match : m))
-      : [...state.results, match];
-    commit({ ...state, results });
+    if (editing) {
+      // Edits stay local to this sweep only
+      const results = state.results.map(m => (m.id === editing ? match : m));
+      commit({ ...state, results });
+    } else {
+      // New result: broadcast to all sweeps on this device
+      addResultsToAll([match]);
+    }
     setForm(EMPTY_FORM);
     setEditing(null);
   }
@@ -1615,7 +1672,7 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock }) {
   function applyPaste() {
     if (!unlocked) { tryUnlock(); return; }
     if (!pastePreview?.parsed?.length) return;
-    commit({ ...state, results: [...state.results, ...pastePreview.parsed] });
+    addResultsToAll(pastePreview.parsed);
     setShowPaste(false);
     setPasteText("");
     setPastePreview(null);
@@ -2348,10 +2405,16 @@ function Styles() {
       /* how it works */
       .howto-p        { margin-bottom: 12px; line-height: 1.6; }
       .howto-p:last-child { margin-bottom: 0; }
-      .howto-bands    { display: flex; flex-direction: column; gap: 5px; margin-top: 6px; }
-      .howto-band     { display: flex; align-items: center; gap: 12px; background: var(--pitch); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; }
-      .howto-band-n   { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; background: var(--gold); color: var(--pitch); border-radius: 5px; font-weight: 700; font-size: 13px; flex-shrink: 0; }
-      .howto-band-l   { font-weight: 600; }
+      .howto-bands      { display: flex; flex-direction: column; gap: 5px; margin-top: 6px; }
+      .howto-band-wrap  { display: flex; flex-direction: column; }
+      .howto-band       { display: flex; align-items: center; gap: 12px; background: var(--pitch); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; width: 100%; text-align: left; cursor: pointer; }
+      .howto-band:hover { border-color: var(--gold); }
+      .howto-band-open  { border-color: var(--gold-dk); border-radius: 8px 8px 0 0; }
+      .howto-band-n     { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; background: var(--gold); color: var(--pitch); border-radius: 5px; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+      .howto-band-l     { font-weight: 600; flex: 1; }
+      .howto-band-count { font-size: 12px; }
+      .howto-band-teams { display: flex; flex-wrap: wrap; gap: 6px; background: var(--panel-2); border: 1px solid var(--gold-dk); border-top: none; border-radius: 0 0 8px 8px; padding: 10px 12px; }
+      .howto-band-team  { display: flex; align-items: center; gap: 5px; background: var(--pitch); border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; font-size: 13px; font-weight: 500; }
       .howto-score    { display: flex; flex-direction: column; gap: 6px; }
       .howto-score-row { display: flex; align-items: flex-start; gap: 12px; background: var(--pitch); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
       .howto-pts      { min-width: 42px; font-size: 17px; font-weight: 700; color: var(--win); flex-shrink: 0; }
