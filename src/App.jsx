@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, Component } from "react";
 import { supabase } from "./supabase.js";
 
 /* ============================================================
@@ -95,7 +95,7 @@ function parseResultsText(text, existingResults = []) {
   for (const line of lines) {
     if (/^[#/]/.test(line)) continue;
     const m = line.match(
-      /^(GROUP|R32|R16|QF|SF|THIRD|FINAL):\s*(.+?)\s+(\d+)-(\d+)\s+(.+?)(?:\s*\(pens:\s*(.+?)\))?(?:\s+reds:(\d+)-(\d+))?\s*$/i
+      /^(GROUP|R32|R16|QF|SF|THIRD|FINAL):\s*(.+?)\s+(\d+)\s*[-\u2013\u2014]\s*(\d+)\s+(.+?)(?:\s*\(pens:\s*(.+?)\))?(?:\s+reds:(\d+)-(\d+))?\s*$/i
     );
     if (!m) { errors.push(`Couldn't parse: "${line}"`); continue; }
 
@@ -189,27 +189,14 @@ function apiRoundToStage(round) {
   return "GROUP";
 }
 
-function apiFixturesToPasteText(fixtures) {
-  return fixtures.map(f => {
-    const { fixture, teams, goals, score } = f;
-    const stageId = apiRoundToStage(f.league?.round);
-    const stage   = STAGE[stageId]?.short || "GROUP";
-    const hName   = teams.home.name;
-    const aName   = teams.away.name;
-    const hId     = apiTeamId(hName);
-    const aId     = apiTeamId(aName);
-    if (!hId || !aId) return null;           // skip unknown teams
-    const hScore  = goals.home ?? 0;
-    const aScore  = goals.away ?? 0;
-    const isPens  = score?.penalty?.home != null;
-    const pensWin = isPens
-      ? (score.penalty.home > score.penalty.away ? hId : aId)
-      : null;
-    const hName2  = TEAM[hId]?.name || hName;
-    const aName2  = TEAM[aId]?.name || aName;
-    let line = `${stageId}: ${hName2} ${hScore}-${aScore} ${aName2}`;
-    if (pensWin) line += ` (pens: ${TEAM[pensWin]?.name || pensWin})`;
-    return line;
+function apiFixturesToPasteText(matches) {
+  return matches.map(m => {
+    const hId = apiTeamId(m.homeTeam);
+    const aId = apiTeamId(m.awayTeam);
+    if (!hId || !aId) return null;
+    const hName = TEAM[hId]?.name || m.homeTeam;
+    const aName = TEAM[aId]?.name || m.awayTeam;
+    return `GROUP: ${hName} ${m.homeScore ?? 0}-${m.awayScore ?? 0} ${aName}`;
   }).filter(Boolean).join("\n");
 }
 
@@ -658,6 +645,28 @@ const cls = (...xs) => xs.filter(Boolean).join(" ");
    COMPONENTS
    ============================================================ */
 
+class ErrorBoundary extends Component {
+  state = { err: null };
+  static getDerivedStateFromError(err) { return { err }; }
+  render() {
+    if (this.state.err) {
+      return (
+        <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column",
+          alignItems:"center", justifyContent:"center", gap:14, color:"#EDF3EC",
+          background:"#0A1B12", padding:24, textAlign:"center" }}>
+          <div style={{ fontWeight:700 }}>Something broke.</div>
+          <button onClick={() => window.location.reload()}
+            style={{ background:"#E9B44C", color:"#1a1407", border:"none",
+              borderRadius:10, padding:"10px 20px", fontWeight:700, cursor:"pointer" }}>
+            Reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const [state, setState]       = useState(null);
   const [sweepId, setSweepId]   = useState(null);   // row id of the loaded sweepstake
@@ -722,30 +731,17 @@ export default function App() {
   // sweepstakes remembered on this device. Edits/deletions stay scoped to the
   // current sweep — only brand-new results are broadcast.
   async function addResultsToAll(newResults) {
-    if (!newResults || newResults.length === 0) return;
-    // 1. Update current sweep
-    const nextState = { ...state, results: [...state.results, ...newResults] };
-    await commit(nextState);
-    // 2. Sync to every other sweep on this device
-    const others = known.filter(k => k.id !== sweepId);
-    for (const sweep of others) {
-      try {
-        const hit = await loadById(sweep.id);
-        if (!hit) continue;
-        const existing = hit.state.results || [];
-        const toAdd = newResults.filter(nr =>
-          !existing.some(er =>
-            er.stage === nr.stage &&
-            ((er.teamA === nr.teamA && er.teamB === nr.teamB) ||
-             (er.teamA === nr.teamB && er.teamB === nr.teamA))
-          )
-        );
-        if (!toAdd.length) continue;
-        await saveSweep(sweep.id, { ...hit.state, results: [...existing, ...toAdd] });
-      } catch (e) {
-        console.warn('Could not sync results to sweep', sweep.id, e);
-      }
+    if (!newResults?.length) return;
+    const merged = [...(state.results || [])];
+    for (const nr of newResults) {
+      const dupe = merged.some(er =>
+        er.stage === nr.stage &&
+        ((er.teamA === nr.teamA && er.teamB === nr.teamB) ||
+         (er.teamA === nr.teamB && er.teamB === nr.teamA))
+      );
+      if (!dupe) merged.push(nr);
     }
+    await commit({ ...state, results: merged });
   }
 
   async function refresh() {
@@ -777,6 +773,7 @@ export default function App() {
   return (
     <div className="app">
       <Styles />
+      <ErrorBoundary>
       {phase === "loading" && <Splash text="Warming up the floodlights…" />}
 
       {phase === "landing" && (
@@ -842,7 +839,8 @@ export default function App() {
           )}
         </>
       )}
-    </div>
+        </ErrorBoundary>
+        </div>
   );
 }
 
@@ -1194,7 +1192,8 @@ function DrawReveal({ state, onDone }) {
           </div>
           <div className="reveal-grid">
             {state.parts.map(p => {
-              const t = TEAM[state.assignments[p.id][r]];
+              const t = TEAM[state.assignments[p.id]?.[r]];
+              if (!t) return null;
               const delay = `${(counter++) * 0.22 + 0.4}s`;
               return (
                 <div className="pick" style={{ animationDelay: delay }} key={p.id + r}>
@@ -1294,8 +1293,9 @@ function HowItWorks({ state, stats }) {
       <div className="card">
         <div className="card-title">The draw</div>
         <p className="howto-p">
-          Every team at the World Cup is ranked and split into six strength bands — Favourites at the top,
-          down through Contenders, Dark horses, Outsiders, Longshots and Wild cards.
+          Every team at the World Cup is ranked, then split into strength bands — Favourites at the
+          top, down through Dark Horses, Outsiders, Passengers, Cannon Fodder and Tourists at the
+          bottom.
         </p>
         <p className="howto-p">
           The draw deals one team from each band to every player, in turn. So everyone ends up with a
@@ -1515,16 +1515,11 @@ function LiveScoresPanel({ state, onImport }) {
   async function fetchScores() {
     setLoading(true); setError(""); setFixtures([]);
     try {
-      const today = new Date();
-      const pad   = n => String(n).padStart(2, "0");
-      const fmt   = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-      const from  = fmt(new Date(today - 3 * 86400000));
-      const to    = fmt(today);
-      const res   = await fetch(`/.netlify/functions/fixtures?status=FT&from=${from}&to=${to}`);
+      const res = await fetch(`/.netlify/functions/fixtures`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data  = await res.json();
+      const data = await res.json();
       if (data.error) throw new Error(data.error);
-      setFixtures(data.response || []);
+      setFixtures((data.matches || []).filter(m => m.statusState === "post"));
     } catch (e) {
       setError(e.message);
     } finally {
@@ -1540,9 +1535,9 @@ function LiveScoresPanel({ state, onImport }) {
   const existingPairs = new Set(
     state.results.map(m => [m.teamA, m.teamB].sort().join("|"))
   );
-  const newFixtures = fixtures.filter(f => {
-    const hId = apiTeamId(f.teams.home.name);
-    const aId = apiTeamId(f.teams.away.name);
+  const newFixtures = fixtures.filter(m => {
+    const hId = apiTeamId(m.homeTeam);
+    const aId = apiTeamId(m.awayTeam);
     if (!hId || !aId) return false;
     return !existingPairs.has([hId, aId].sort().join("|"));
   });
@@ -1576,20 +1571,20 @@ function LiveScoresPanel({ state, onImport }) {
           )}
           {!loading && fixtures.length > 0 && (
             <>
-              {fixtures.map(f => {
-                const hId  = apiTeamId(f.teams.home.name);
-                const aId  = apiTeamId(f.teams.away.name);
-                const hT   = hId ? TEAM[hId] : { name: f.teams.home.name, flag: "🏳" };
-                const aT   = aId ? TEAM[aId] : { name: f.teams.away.name, flag: "🏳" };
+              {fixtures.map(m => {
+                const hId  = apiTeamId(m.homeTeam);
+                const aId  = apiTeamId(m.awayTeam);
+                const hT   = hId ? TEAM[hId] : { name: m.homeTeam, flag: "🏳" };
+                const aT   = aId ? TEAM[aId] : { name: m.awayTeam, flag: "🏳" };
                 const isNew = hId && aId && !existingPairs.has([hId,aId].sort().join("|"));
                 return (
-                  <div key={f.fixture.id} className="ls-row">
+                  <div key={m.id} className="ls-row">
                     <span className="mstage mono" style={{ fontSize:11 }}>
-                      {apiRoundToStage(f.league?.round).replace("GROUP","GRP")}
+                      GRP
                     </span>
                     <span className="ls-teams">
                       {hT.flag} {hT.name}{" "}
-                      <strong className="mono">{f.goals.home}–{f.goals.away}</strong>{" "}
+                      <strong className="mono">{m.homeScore}–{m.awayScore}</strong>{" "}
                       {aT.name} {aT.flag}
                     </span>
                     {isNew && <span className="ls-new">new</span>}
