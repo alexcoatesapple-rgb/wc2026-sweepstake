@@ -732,16 +732,37 @@ export default function App() {
   // current sweep — only brand-new results are broadcast.
   async function addResultsToAll(newResults) {
     if (!newResults?.length) return;
-    const merged = [...(state.results || [])];
-    for (const nr of newResults) {
-      const dupe = merged.some(er =>
-        er.stage === nr.stage &&
-        ((er.teamA === nr.teamA && er.teamB === nr.teamB) ||
-         (er.teamA === nr.teamB && er.teamB === nr.teamA))
-      );
-      if (!dupe) merged.push(nr);
+
+    // Merge new results into an existing list, skipping any that already exist
+    // (same stage + same pair of teams, either order).
+    const mergeInto = (existing) => {
+      const merged = [...(existing || [])];
+      for (const nr of newResults) {
+        const dupe = merged.some(er =>
+          er.stage === nr.stage &&
+          ((er.teamA === nr.teamA && er.teamB === nr.teamB) ||
+           (er.teamA === nr.teamB && er.teamB === nr.teamA))
+        );
+        if (!dupe) merged.push(nr);
+      }
+      return merged;
+    };
+
+    // 1) Current sweep — update the UI and save.
+    await commit({ ...state, results: mergeInto(state.results) });
+
+    // 2) Every OTHER sweepstake remembered on this device. Load each fresh
+    //    from the server, merge the new results in, and save it back. This is
+    //    what makes "enter a result once, every sweep updates" actually work.
+    const others = loadKnownSweeps().filter(k => k.id !== sweepId);
+    for (const k of others) {
+      const hit = await loadById(k.id);
+      if (!hit) continue;
+      const nextResults = mergeInto(hit.state.results);
+      if (nextResults.length !== (hit.state.results?.length || 0)) {
+        await saveSweep(k.id, { ...hit.state, results: nextResults });
+      }
     }
-    await commit({ ...state, results: merged });
   }
 
   async function refresh() {
@@ -782,6 +803,16 @@ export default function App() {
           onOpen={openSweep}
           onForget={id => { forgetSweep(id); setKnown(loadKnownSweeps()); }}
           onCreate={() => setPhase("setup")}
+          onAdmin={() => setPhase("admin")}
+        />
+      )}
+
+      {phase === "admin" && (
+        <AdminView
+          known={known}
+          onOpen={openSweep}
+          onForget={id => { forgetSweep(id); setKnown(loadKnownSweeps()); }}
+          onBack={() => setPhase(sweepId && state ? "main" : "landing")}
         />
       )}
 
@@ -817,6 +848,7 @@ export default function App() {
             showReveal={() => setPhase("reveal")}
             onMatchdayReport={() => setShowShare(true)}
             goHome={goHome}
+            goAdmin={() => setPhase("admin")}
             addResultsToAll={addResultsToAll}
             switchTo={async id => {
               const hit = await loadById(id);
@@ -845,7 +877,7 @@ export default function App() {
 }
 
 /* ---- Landing / sweepstake picker ---- */
-function Landing({ known, onOpen, onForget, onCreate }) {
+function Landing({ known, onOpen, onForget, onCreate, onAdmin }) {
   const [pin, setPin]   = useState("");
   const [err, setErr]   = useState("");
   const [busy, setBusy] = useState(false);
@@ -888,7 +920,16 @@ function Landing({ known, onOpen, onForget, onCreate }) {
 
       {known.length > 0 && (
         <div className="card">
-          <div className="card-title">On this device</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div className="card-title" style={{ marginBottom: 0 }}>On this device</div>
+            {known.length > 1 && (
+              <button
+                className="btn-ghost"
+                style={{ marginTop: 0, padding: "5px 12px", fontSize: 13 }}
+                onClick={onAdmin}
+              >📊 Admin view</button>
+            )}
+          </div>
           <div className="known-list">
             {known.map(k => (
               <div key={k.id} className="known-row">
@@ -911,6 +952,100 @@ function Landing({ known, onOpen, onForget, onCreate }) {
       <button className="btn-ghost" style={{ width: "100%" }} onClick={onCreate}>
         + Create a new sweepstake
       </button>
+    </div>
+  );
+}
+
+/* ---- Admin / Mission Control: every sweepstake on this device at a glance ---- */
+function AdminView({ known, onOpen, onForget, onBack }) {
+  const [rows, setRows] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const loaded = await Promise.all(
+        known.map(async k => {
+          const hit = await loadById(k.id);
+          if (!hit) {
+            return { id: k.id, name: k.name, viewPin: k.viewPin, missing: true };
+          }
+          const stats   = buildStats(hit.state);
+          const started = (hit.state.results?.length || 0) > 0;
+          return {
+            id:       k.id,
+            name:     hit.state.name || k.name || "Untitled sweepstake",
+            viewPin:  hit.state.viewPin || k.viewPin || k.id,
+            players:  hit.state.parts?.length || 0,
+            teamsPer: hit.state.teamsPer || 0,
+            results:  hit.state.results?.length || 0,
+            leader:   started ? stats.players[0] : null,
+            state:    hit.state,
+          };
+        })
+      );
+      if (!cancelled) setRows(loaded);
+    })();
+    return () => { cancelled = true; };
+  }, [known]);
+
+  return (
+    <div className="setup">
+      <button className="btn-ghost" style={{ marginTop: 0, marginBottom: 18 }} onClick={onBack}>← Back</button>
+      <div className="setup-eyebrow">ADMIN · ALL YOUR SWEEPSTAKES</div>
+      <h1 className="display setup-title" style={{ fontSize: "clamp(36px,9vw,64px)" }}>MISSION<br />CONTROL</h1>
+      <p className="setup-sub">
+        Every sweepstake remembered on this device, at a glance. Tap one to jump straight in.
+      </p>
+
+      {rows === null && <div className="dim">Loading your sweepstakes…</div>}
+      {rows && rows.length === 0 && (
+        <div className="notice">No sweepstakes remembered on this device yet.</div>
+      )}
+
+      <div className="admin-grid">
+        {rows?.map(r => (
+          <div key={r.id} className="admin-card">
+            {r.missing ? (
+              <>
+                <div className="admin-name">{r.name || "Untitled sweepstake"}</div>
+                <div className="dim small">
+                  No longer reachable on the server.{" "}
+                  <button className="linklike" onClick={() => onForget(r.id)}>Forget</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="admin-top">
+                  <div className="admin-name">{r.name}</div>
+                  <span className="admin-pin mono">PIN {r.viewPin}</span>
+                </div>
+                <div className="admin-stats">
+                  <span><b className="mono">{r.players}</b> players</span>
+                  <span><b className="mono">{r.teamsPer}</b> teams each</span>
+                  <span><b className="mono">{r.results}</b> results in</span>
+                </div>
+                <div className="admin-leader">
+                  {r.leader
+                    ? <>🏆 <b>{r.leader.name}</b> leading on <span className="mono">{r.leader.total}</span> pts</>
+                    : <span className="dim">No results yet — everyone level.</span>}
+                </div>
+                <div className="admin-actions">
+                  <button
+                    className="btn-primary"
+                    style={{ marginTop: 0, padding: "9px 18px" }}
+                    onClick={() => onOpen(r.id, r.state)}
+                  >Open →</button>
+                  <button
+                    className="mini mini-red"
+                    title="Forget on this device"
+                    onClick={() => onForget(r.id)}
+                  >✕</button>
+                </div>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1217,7 +1352,7 @@ function DrawReveal({ state, onDone }) {
 /* ---- Main shell ---- */
 function Main({
   state, sweepId, known, commit, refresh, saveStatus, tab, setTab,
-  unlocked, tryUnlock, showReveal, onMatchdayReport, resetAll, goHome, switchTo, addResultsToAll,
+  unlocked, tryUnlock, showReveal, onMatchdayReport, resetAll, goHome, goAdmin, switchTo, addResultsToAll,
 }) {
   const stats = useMemo(() => buildStats(state), [state]);
   const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["howto","How it works"],["setup","Setup"]];
@@ -1248,6 +1383,9 @@ function Main({
                 <option key={k.id} value={k.id}>{k.name || k.viewPin}</option>
               ))}
             </select>
+          )}
+          {known.length > 1 && (
+            <button className="btn-icon" title="Admin: all sweepstakes" onClick={goAdmin}>📊</button>
           )}
           <button className="btn-icon" title="Refresh" onClick={refresh}>↻</button>
         </div>
@@ -1390,20 +1528,40 @@ function HowItWorks({ state, stats }) {
 
 /* ---- Table / Leaderboard ---- */
 function TableView({ state, stats, onMatchdayReport }) {
-  const [open, setOpen] = useState(null);
+  const [openIds, setOpenIds] = useState(() => new Set());
   const leaderPts = stats.players[0]?.total ?? 0;
+  const allOpen = stats.players.length > 0 && openIds.size === stats.players.length;
+
+  function toggleRow(id) {
+    setOpenIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+  function toggleAll() {
+    setOpenIds(allOpen ? new Set() : new Set(stats.players.map(p => p.id)));
+  }
+
   return (
     <div className="pane">
       {state.results.length === 0 && (
         <div className="notice">No results in yet. Everyone's level on 0 — enjoy it while it lasts.</div>
       )}
+      {stats.players.length > 0 && (
+        <div className="board-tools">
+          <button className="btn-ghost" onClick={toggleAll}>
+            {allOpen ? "Collapse all" : "Expand all"}
+          </button>
+        </div>
+      )}
       <div className="board">
         {stats.players.map(p => {
           const isLeader = p.rank === 1 && state.results.length > 0;
-          const isOpen   = open === p.id;
+          const isOpen   = openIds.has(p.id);
           return (
             <div key={p.id} className={cls("row-wrap", isLeader && "leader")}>
-              <button className="row" onClick={() => setOpen(isOpen ? null : p.id)}>
+              <button className="row" onClick={() => toggleRow(p.id)}>
                 <span className="row-rank mono">{p.rank}</span>
                 <span className="row-name">{p.name}</span>
                 <span className="row-alive dim">{p.alive}/{p.teams.length} alive</span>
@@ -1893,6 +2051,7 @@ R16: Argentina 1-1 England (pens: Argentina)`}
 function SetupView({ state, commit, sweepId, unlocked, tryUnlock, showReveal, resetAll }) {
   const [sc, setSc]   = useState({ ...DEFAULT_SCORING, ...(state.scoring || {}) });
   const [orgPin, setOrgPin] = useState(state.organiserPin || "");
+  const [nameEdit, setNameEdit] = useState(state.name || "");
   const [copied, setCopied] = useState(false);
   const [showImport, setShowImport]     = useState(false);
   const [importText, setImportText]     = useState("");
@@ -1951,6 +2110,24 @@ function SetupView({ state, commit, sweepId, unlocked, tryUnlock, showReveal, re
           <button className="linklike" onClick={tryUnlock}>Unlock</button>
         </div>
       )}
+
+      <div className="card">
+        <div className="card-title">Sweepstake name</div>
+        <div className="frow" style={{ marginTop: 0 }}>
+          <input
+            className="inp"
+            value={nameEdit}
+            onChange={e => setNameEdit(e.target.value)}
+            style={{ flex: 1 }}
+          />
+          <button className="btn-ghost" style={{ marginTop: 0 }} onClick={guard(() => {
+            const v = nameEdit.trim();
+            if (!v) { window.alert("Give the sweepstake a name."); return; }
+            commit({ ...state, name: v });
+          })}>Rename</button>
+        </div>
+        <div className="dim small">Renaming updates it for everyone using this sweepstake.</div>
+      </div>
 
       <div className="card">
         <div className="card-title">Share this sweepstake</div>
@@ -2315,6 +2492,8 @@ function Styles() {
       .notice         { background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; padding: 14px; color: var(--dim); margin-bottom: 14px; }
 
       /* leaderboard */
+      .board-tools    { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+      .board-tools .btn-ghost { margin-top: 0; padding: 6px 12px; font-size: 13px; }
       .board          { display: flex; flex-direction: column; gap: 8px; }
       .row-wrap       { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; position: relative; }
       .row-wrap.leader { border-color: var(--gold-dk); box-shadow: 0 0 0 1px var(--gold-dk), 0 6px 24px -12px #e9b44c66; }
@@ -2410,6 +2589,18 @@ function Styles() {
       .hdr-home       { border: none; cursor: pointer; }
       .hdr-home:hover { background: #f4c763; }
       .sweep-switch   { background: var(--panel); border: 1px solid var(--line); color: var(--chalk); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 13px; max-width: 130px; }
+
+      /* admin / mission control */
+      .admin-grid     { display: flex; flex-direction: column; gap: 10px; }
+      .admin-card     { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+      .admin-top      { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .admin-name     { font-weight: 700; font-size: 16px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .admin-pin      { font-size: 12px; color: var(--gold); flex-shrink: 0; }
+      .admin-stats    { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px; font-size: 13px; color: var(--dim); }
+      .admin-stats b  { color: var(--chalk); font-weight: 700; }
+      .admin-leader   { margin-top: 10px; font-size: 14px; }
+      .admin-actions  { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+      .admin-actions .btn-primary { flex: 1; text-align: center; }
 
       /* share card */
       .share-pin-row  { display: flex; align-items: center; justify-content: space-between; background: var(--pitch); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
