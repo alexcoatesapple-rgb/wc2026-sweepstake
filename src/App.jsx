@@ -486,12 +486,27 @@ function wrapText(ctx, text, x, y, maxW, lineH) {
 }
 
 function buildShareCanvas(players, commentary, sweepstakeName, eliminated) {
+  // Palette — Paper + England Red
+  const C = {
+    bg:         "#EDE6DC",
+    card:       "#FFFFFF",
+    accent:     "#C8000A",
+    ink:        "#141414",
+    muted:      "#B0A89E",
+    line:       "#E5DDD3",
+    rank:       "#DDD6CE",
+    track:      "#F2ECE5",
+    accentSoft: "#fce8e9",
+  };
+
   const W        = 600;
-  const HEADER_H = 96;
-  const ROW_H    = 66;
-  const COMM_H   = 82;
-  const FOOTER_H = 36;
-  const H        = HEADER_H + players.length * ROW_H + COMM_H + FOOTER_H;
+  const HDR_H    = 54;   // accent header bar
+  const SUB_H    = 38;   // leader-eyebrow / sweepname sub-row
+  const BAR_H    = 3;
+  const ROW_H    = 62;
+  const COMM_H   = 68;
+  const FOOTER_H = 32;
+  const H = HDR_H + SUB_H + players.length * (ROW_H + BAR_H) + COMM_H + FOOTER_H;
 
   const canvas = document.createElement("canvas");
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
@@ -503,137 +518,175 @@ function buildShareCanvas(players, commentary, sweepstakeName, eliminated) {
   const ctx = canvas.getContext("2d");
   ctx.scale(dpr, dpr);
 
-  // Background
-  ctx.fillStyle = "#0A1B12";
+  // ── Paper background ──────────────────────────────────────────
+  ctx.fillStyle = C.bg;
   ctx.fillRect(0, 0, W, H);
 
-  // Subtle pitch-grid lines
-  ctx.strokeStyle = "rgba(255,255,255,0.04)";
-  ctx.lineWidth = 1;
-  for (let y = 0; y <= H; y += 64) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-  }
+  // ── Accent header bar ─────────────────────────────────────────
+  ctx.fillStyle = C.accent;
+  ctx.fillRect(0, 0, W, HDR_H);
 
-  // Header gradient strip
-  const hg = ctx.createLinearGradient(0, 0, W, HEADER_H);
-  hg.addColorStop(0, "#172E1E");
-  hg.addColorStop(1, "#0A1B12");
-  ctx.fillStyle = hg;
-  ctx.fillRect(0, 0, W, HEADER_H);
-
-  // WC26 badge
-  ctx.fillStyle = "#E9B44C";
-  rrect(ctx, 20, 18, 66, 32, 6);
+  // WC26 badge (white bg, red text)
+  ctx.fillStyle = "#FFFFFF";
+  rrect(ctx, 16, 13, 52, 28, 4);
   ctx.fill();
-  ctx.fillStyle = "#1a1407";
-  ctx.font = "700 14px -apple-system, system-ui, sans-serif";
+  ctx.fillStyle = C.accent;
+  ctx.font = "700 13px -apple-system, system-ui, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText("WC26", 53, 34);
+  ctx.fillText("WC26", 42, 27);
 
-  // Title
-  ctx.fillStyle = "#EDF3EC";
-  ctx.font = "700 18px -apple-system, system-ui, sans-serif";
+  // Sweep name
+  ctx.fillStyle = "#FFFFFF";
+  ctx.font = "700 17px -apple-system, system-ui, sans-serif";
   ctx.textAlign = "left";
-  ctx.textBaseline = "alphabetic";
-  ctx.fillText("SWEEPSTAKE STANDINGS", 100, 36);
+  ctx.textBaseline = "middle";
+  ctx.fillText(sweepstakeName, 80, HDR_H / 2);
 
-  // Name + date line
-  ctx.fillStyle = "#8BA694";
-  ctx.font = "400 12px -apple-system, system-ui, sans-serif";
-  ctx.fillText(sweepstakeName, 100, 55);
-
+  // Date (right)
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.font = "500 11px -apple-system, system-ui, sans-serif";
   ctx.textAlign = "right";
   ctx.fillText(
     new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" }),
-    W - 20, 55
+    W - 16, HDR_H / 2
   );
 
-  // Header divider
-  ctx.strokeStyle = "#22422F";
+  // ── Sub-row (standings label + LIVE dot) ──────────────────────
+  const subY = HDR_H;
+  ctx.fillStyle = C.card;
+  ctx.fillRect(0, subY, W, SUB_H);
+  ctx.strokeStyle = C.line;
   ctx.lineWidth = 1;
-  hline(ctx, 0, W, HEADER_H);
+  hline(ctx, 0, W, subY + SUB_H);
 
-  // Player rows
+  ctx.fillStyle = C.accent;
+  ctx.font = "700 9px -apple-system, system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText("STANDINGS · GROUP STAGE", 16, subY + SUB_H / 2);
+
+  // LIVE dot
+  ctx.beginPath();
+  ctx.arc(W - 30, subY + SUB_H / 2, 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = C.accent;
+  ctx.fill();
+  ctx.fillStyle = C.muted;
+  ctx.font = "700 9px -apple-system, system-ui, sans-serif";
+  ctx.textAlign = "right";
+  ctx.fillText("LIVE", W - 16, subY + SUB_H / 2);
+
+  // ── Player rows ───────────────────────────────────────────────
+  const leaderPts = players[0]?.total ?? 0;
+
   players.forEach((p, i) => {
-    const rowY = HEADER_H + i * ROW_H;
-    const midY = rowY + ROW_H / 2;
+    const rowY   = HDR_H + SUB_H + i * (ROW_H + BAR_H);
+    const midY   = rowY + ROW_H / 2;
     const isLeader = i === 0 && p.total > 0;
 
+    // Card background
+    ctx.fillStyle = isLeader ? C.accentSoft : C.card;
+    ctx.fillRect(0, rowY, W, ROW_H);
+
+    // Leader: left accent stripe
     if (isLeader) {
-      ctx.fillStyle = "rgba(233,180,76,0.08)";
-      ctx.fillRect(0, rowY, W, ROW_H);
+      ctx.fillStyle = C.accent;
+      ctx.fillRect(0, rowY, 4, ROW_H);
     }
 
     // Rank
-    ctx.fillStyle = isLeader ? "#E9B44C" : "#8BA694";
-    ctx.font = "700 16px -apple-system, system-ui, sans-serif";
-    ctx.textAlign = "right";
+    ctx.fillStyle = isLeader ? C.accent : C.rank;
+    ctx.font = "700 20px -apple-system, system-ui, sans-serif";
+    ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(String(p.rank), 44, midY - 8);
+    ctx.fillText(String(p.rank), 36, midY - 6);
 
     // Name
-    ctx.fillStyle = "#EDF3EC";
-    ctx.font = "600 16px -apple-system, system-ui, sans-serif";
+    ctx.fillStyle = C.ink;
+    ctx.font = "700 15px -apple-system, system-ui, sans-serif";
     ctx.textAlign = "left";
-    ctx.fillText(p.name, 56, midY - 8);
+    ctx.fillText(p.name, 58, midY - 8);
 
-    // Team flags: alive full opacity, eliminated dimmed
+    // Alive count
+    ctx.fillStyle = C.muted;
+    ctx.font = "500 11px -apple-system, system-ui, sans-serif";
+    ctx.fillText(`${p.alive} alive`, 58, midY + 9);
+
+    // Team flags
     const aliveTeams = p.teams.filter(t => !eliminated.has(t));
     const deadTeams  = p.teams.filter(t => eliminated.has(t));
-    ctx.font = `15px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
+    ctx.font = `13px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
     ctx.textBaseline = "middle";
-    let fx = 56;
-
+    let fx = 180;
     ctx.globalAlpha = 1;
     for (const tid of aliveTeams) {
-      const t = TEAM[tid];
-      if (!t) continue;
-      ctx.fillText(t.flag, fx, midY + 12);
-      fx += 22;
+      const t = TEAM[tid]; if (!t || fx > W - 100) continue;
+      ctx.fillText(t.flag, fx, midY - 2); fx += 20;
     }
-    ctx.globalAlpha = 0.28;
+    ctx.globalAlpha = 0.3;
     for (const tid of deadTeams) {
-      const t = TEAM[tid];
-      if (!t) continue;
-      ctx.fillText(t.flag, fx, midY + 12);
-      fx += 22;
+      const t = TEAM[tid]; if (!t || fx > W - 100) continue;
+      ctx.fillText(t.flag, fx, midY - 2); fx += 20;
     }
     ctx.globalAlpha = 1;
 
     // Points
-    ctx.fillStyle = isLeader ? "#E9B44C" : "#EDF3EC";
-    ctx.font = "700 23px -apple-system, system-ui, sans-serif";
+    ctx.fillStyle = isLeader ? C.accent : C.ink;
+    ctx.font = `700 22px -apple-system, system-ui, sans-serif`;
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
-    ctx.fillText(String(p.total), W - 20, midY - 4);
+    ctx.fillText(String(p.total), W - 16, midY - 6);
 
-    // Row divider
-    if (i < players.length - 1) {
-      ctx.strokeStyle = "#1E3829";
-      ctx.lineWidth = 1;
-      hline(ctx, 0, W, rowY + ROW_H);
+    // Gap to leader
+    if (!isLeader && leaderPts > 0) {
+      ctx.fillStyle = C.muted;
+      ctx.font = "500 10px -apple-system, system-ui, sans-serif";
+      ctx.fillText(`−${leaderPts - p.total}`, W - 16, midY + 10);
+    }
+
+    // Row bottom border
+    ctx.strokeStyle = C.line;
+    ctx.lineWidth = 1;
+    hline(ctx, 0, W, rowY + ROW_H);
+
+    // Progress bar
+    const barY = rowY + ROW_H;
+    ctx.fillStyle = C.track;
+    ctx.fillRect(0, barY, W, BAR_H);
+    if (leaderPts > 0) {
+      ctx.fillStyle = C.accent;
+      ctx.fillRect(0, barY, W * (p.total / leaderPts), BAR_H);
     }
   });
 
-  // Commentary section
-  const commY = HEADER_H + players.length * ROW_H;
-  ctx.strokeStyle = "#22422F";
+  // ── Commentary ────────────────────────────────────────────────
+  const commY = HDR_H + SUB_H + players.length * (ROW_H + BAR_H);
+  ctx.fillStyle = C.card;
+  ctx.fillRect(0, commY, W, COMM_H);
+  ctx.strokeStyle = C.line;
   ctx.lineWidth = 1;
   hline(ctx, 0, W, commY);
 
-  ctx.fillStyle = "#8BA694";
-  ctx.font = "italic 400 13.5px -apple-system, system-ui, sans-serif";
+  ctx.font = `14px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
   ctx.textAlign = "left";
   ctx.textBaseline = "alphabetic";
-  wrapText(ctx, commentary, 22, commY + 30, W - 44, 20);
+  ctx.fillText("⚽", 16, commY + 30);
 
-  // Footer
-  hline(ctx, 0, W, H - FOOTER_H);
-  ctx.fillStyle = "#3a5e47";
-  ctx.font = "500 11px -apple-system, system-ui, sans-serif";
+  ctx.fillStyle = C.muted;
+  ctx.font = "italic 400 12.5px -apple-system, system-ui, sans-serif";
+  wrapText(ctx, commentary, 38, commY + 28, W - 54, 19);
+
+  // ── Footer ────────────────────────────────────────────────────
+  const footY = commY + COMM_H;
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, footY, W, FOOTER_H);
+  hline(ctx, 0, W, footY);
+
+  ctx.fillStyle = C.muted;
+  ctx.font = "600 10px -apple-system, system-ui, sans-serif";
   ctx.textAlign = "center";
-  ctx.fillText(sweepstakeName.toUpperCase(), W / 2, H - FOOTER_H + 22);
+  ctx.textBaseline = "middle";
+  ctx.fillText(sweepstakeName.toUpperCase(), W / 2, footY + FOOTER_H / 2);
 
   return canvas;
 }
