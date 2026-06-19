@@ -351,7 +351,7 @@ function buildStats(state) {
     [m.teamA, m.teamB].forEach(t => {
       if (ownedTeams.has(t)) teamPts[t] = (teamPts[t] || 0) + teamMatchPts(t, m, sc);
     });
-    if (m.stage !== "GROUP") {
+    if (m.stage !== "GROUP" && !m.live) {
       const w = koWinner(m);
       const loser = w === m.teamA ? m.teamB : w === m.teamB ? m.teamA : null;
       if (loser) eliminated.add(loser);
@@ -754,6 +754,10 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Auto-apply finished ESPN results whenever a sweep is (re-)loaded.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (sweepId) autoSyncFromESPN(); }, [sweepId]);
+
   function openSweep(id, st) {
     setSweepId(id);
     setState(st);
@@ -783,39 +787,85 @@ export default function App() {
   // Adds new results to the current sweep AND silently syncs them to all other
   // sweepstakes remembered on this device. Edits/deletions stay scoped to the
   // current sweep — only brand-new results are broadcast.
-  async function addResultsToAll(newResults) {
+  async function addResultsToAll(newResults, { updateExisting = false } = {}) {
     if (!newResults?.length) return;
 
-    // Merge new results into an existing list, skipping any that already exist
-    // (same stage + same pair of teams, either order).
+    // Merge new results into an existing list. By default skips duplicates
+    // (same stage + same pair of teams, either order). With updateExisting=true,
+    // replaces a match if scores or red cards differ — used by auto-sync so a
+    // corrected ESPN score lands without manual intervention.
     const mergeInto = (existing) => {
+      let changed = false;
       const merged = [...(existing || [])];
       for (const nr of newResults) {
-        const dupe = merged.some(er =>
+        const idx = merged.findIndex(er =>
           er.stage === nr.stage &&
           ((er.teamA === nr.teamA && er.teamB === nr.teamB) ||
            (er.teamA === nr.teamB && er.teamB === nr.teamA))
         );
-        if (!dupe) merged.push(nr);
+        if (idx === -1) {
+          merged.push(nr);
+          changed = true;
+        } else if (updateExisting) {
+          const er = merged[idx];
+          // ESPN home/away may be reversed vs how this sweep stored teamA/teamB
+          const flipped = er.teamA === nr.teamB;
+          const scoreA = flipped ? nr.scoreB : nr.scoreA;
+          const scoreB = flipped ? nr.scoreA : nr.scoreB;
+          const redsA  = flipped ? nr.redsB  : nr.redsA;
+          const redsB  = flipped ? nr.redsA  : nr.redsB;
+          if (er.scoreA !== scoreA || er.scoreB !== scoreB ||
+              er.redsA  !== redsA  || er.redsB  !== redsB) {
+            merged[idx] = { ...er, scoreA, scoreB, redsA, redsB };
+            changed = true;
+          }
+        }
       }
-      return merged;
+      return { results: merged, changed };
     };
 
-    // 1) Current sweep — update the UI and save.
-    await commit({ ...state, results: mergeInto(state.results) });
+    // 1) Current sweep — update the UI and save only if something changed.
+    const { results: nextCurrent, changed: currentChanged } = mergeInto(state.results);
+    if (currentChanged) await commit({ ...state, results: nextCurrent });
 
     // 2) Every OTHER sweepstake remembered on this device. Load each fresh
-    //    from the server, merge the new results in, and save it back. This is
-    //    what makes "enter a result once, every sweep updates" actually work.
+    //    from the server, merge the new results in, and save it back.
     const others = loadKnownSweeps().filter(k => k.id !== sweepId);
     for (const k of others) {
       const hit = await loadById(k.id);
       if (!hit) continue;
-      const nextResults = mergeInto(hit.state.results);
-      if (nextResults.length !== (hit.state.results?.length || 0)) {
-        await saveSweep(k.id, { ...hit.state, results: nextResults });
-      }
+      const { results: nextResults, changed } = mergeInto(hit.state.results);
+      if (changed) await saveSweep(k.id, { ...hit.state, results: nextResults });
     }
+  }
+
+  async function autoSyncFromESPN() {
+    try {
+      const res = await fetch('/.netlify/functions/fixtures');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.error) return;
+      const newResults = (data.matches || [])
+        .filter(m => m.statusState === 'post')
+        .flatMap(m => {
+          const hId = apiTeamId(m.homeTeam);
+          const aId = apiTeamId(m.awayTeam);
+          if (!hId || !aId) return [];
+          return [{
+            id: 'espn_' + m.id,
+            stage: apiRoundToStage(m.round),
+            teamA: hId,
+            teamB: aId,
+            scoreA: Number(m.homeScore) || 0,
+            scoreB: Number(m.awayScore) || 0,
+            redsA: m.redCardsHome || 0,
+            redsB: m.redCardsAway || 0,
+            pensWinner: null,
+            at: m.date,
+          }];
+        });
+      await addResultsToAll(newResults, { updateExisting: true });
+    } catch (_) {}
   }
 
   async function refresh() {
@@ -1407,7 +1457,55 @@ function Main({
   state, sweepId, known, commit, refresh, saveStatus, tab, setTab,
   unlocked, tryUnlock, showReveal, onMatchdayReport, resetAll, goHome, goAdmin, switchTo, addResultsToAll,
 }) {
-  const stats = useMemo(() => buildStats(state), [state]);
+  const [espnMatches, setEspnMatches] = useState([]);
+  useEffect(() => {
+    async function fetchLive() {
+      try {
+        const res = await fetch('/.netlify/functions/fixtures');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.error) return;
+        setEspnMatches(data.matches || []);
+      } catch (_) {}
+    }
+    fetchLive();
+    const id = setInterval(fetchLive, 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const existingPairs = useMemo(
+    () => new Set((state.results || []).map(r => [r.teamA, r.teamB].sort().join('|'))),
+    [state.results]
+  );
+
+  // Live in-progress games converted to provisional result objects for scoring.
+  // Display-only — never saved. Points update every 60s as the score changes.
+  const provisionalLive = useMemo(() =>
+    espnMatches
+      .filter(m => m.statusState === 'in')
+      .flatMap(m => {
+        const hId = apiTeamId(m.homeTeam);
+        const aId = apiTeamId(m.awayTeam);
+        if (!hId || !aId) return [];
+        if (existingPairs.has([hId, aId].sort().join('|'))) return [];
+        return [{
+          id: 'live_' + m.id,
+          stage: apiRoundToStage(m.round),
+          teamA: hId, teamB: aId,
+          scoreA: Number(m.homeScore) || 0,
+          scoreB: Number(m.awayScore) || 0,
+          redsA: m.redCardsHome || 0,
+          redsB: m.redCardsAway || 0,
+          pensWinner: null, at: m.date, live: true,
+        }];
+      }),
+    [espnMatches, existingPairs]
+  );
+
+  const stats = useMemo(
+    () => buildStats({ ...state, results: [...(state.results || []), ...provisionalLive] }),
+    [state, provisionalLive]
+  );
   const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["howto","How it works"],["setup","Setup"]];
   const others = known.filter(k => k.id !== sweepId);
   return (
@@ -1436,10 +1534,12 @@ function Main({
             <button className="btn-icon" title="Admin: all sweepstakes" onClick={goAdmin}>📊</button>
           )}
           <button className="btn-icon" title="Refresh" onClick={refresh}>↻</button>
-          <div className="hdr-live">
-            <span className="live-dot" />
-            <span className="live-label">LIVE</span>
-          </div>
+          {provisionalLive.length > 0 && (
+            <div className="hdr-live">
+              <span className="live-dot" />
+              <span className="live-label">LIVE</span>
+            </div>
+          )}
         </div>
       </header>
       <nav className="tabs">
@@ -1449,9 +1549,9 @@ function Main({
           </button>
         ))}
       </nav>
-      {tab === "table"   && <TableView   state={state} stats={stats} onMatchdayReport={onMatchdayReport} />}
+      {tab === "table"   && <TableView   state={state} stats={stats} onMatchdayReport={onMatchdayReport} hasLive={provisionalLive.length > 0} />}
       {tab === "teams"   && <TeamsView   state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} />}
-      {tab === "matches" && <MatchesView state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} addResultsToAll={addResultsToAll} />}
+      {tab === "matches" && <MatchesView state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} addResultsToAll={addResultsToAll} espnMatches={espnMatches} />}
       {tab === "howto"   && <HowItWorks  state={state} stats={stats} />}
       {tab === "setup"   && (
         <SetupView
@@ -1579,7 +1679,7 @@ function HowItWorks({ state, stats }) {
 }
 
 /* ---- Table / Leaderboard ---- */
-function TableView({ state, stats, onMatchdayReport }) {
+function TableView({ state, stats, onMatchdayReport, hasLive }) {
   const [openIds, setOpenIds] = useState(() => {
     const leader = stats.players[0];
     return leader ? new Set([leader.id]) : new Set();
@@ -1625,7 +1725,10 @@ function TableView({ state, stats, onMatchdayReport }) {
     <div className="board-wrap">
       {/* Eyebrow */}
       <div className="board-eyebrow">
-        <span className="board-eyebrow-label">Standings · {stageLabel}</span>
+        <span className="board-eyebrow-label">
+          Standings · {stageLabel}
+          {hasLive && <span style={{ marginLeft:6, color:"#c62828", fontSize:11, fontWeight:700, letterSpacing:"0.04em" }}>● LIVE</span>}
+        </span>
         <div className="board-eyebrow-line" />
         <button
           className="btn-ghost"
@@ -1856,46 +1959,28 @@ const EMPTY_FORM = {
 };
 
 /* ---- Live Scores Panel ---- */
-function LiveScoresPanel({ state, onImport }) {
-  const [open, setOpen]       = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError]     = useState("");
-  const [fixtures, setFixtures] = useState([]);
-
-  async function fetchScores() {
-    setLoading(true); setError(""); setFixtures([]);
-    try {
-      const res = await fetch(`/.netlify/functions/fixtures`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setFixtures((data.matches || []).filter(m => m.statusState === "post"));
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function toggle() {
-    if (!open) fetchScores();
-    setOpen(v => !v);
-  }
+function LiveScoresPanel({ state, espnMatches, onImport }) {
+  const [open, setOpen] = useState(true);
 
   const existingPairs = new Set(
     state.results.map(m => [m.teamA, m.teamB].sort().join("|"))
   );
-  const newFixtures = fixtures.filter(m => {
+
+  const liveMatches  = espnMatches.filter(m => m.statusState === 'in');
+  const newFinished  = espnMatches.filter(m => {
+    if (m.statusState !== 'post') return false;
     const hId = apiTeamId(m.homeTeam);
     const aId = apiTeamId(m.awayTeam);
     if (!hId || !aId) return false;
     return !existingPairs.has([hId, aId].sort().join("|"));
   });
 
-  function importAll() {
-    const text = apiFixturesToPasteText(newFixtures);
+  function importNew() {
+    const text = apiFixturesToPasteText(newFinished);
     if (text) onImport(text);
   }
+
+  if (liveMatches.length === 0 && newFinished.length === 0) return null;
 
   return (
     <div className="card">
@@ -1906,7 +1991,7 @@ function LiveScoresPanel({ state, onImport }) {
         <button
           className="btn-ghost"
           style={{ marginTop:0, padding:"5px 12px", fontSize:13 }}
-          onClick={toggle}
+          onClick={() => setOpen(v => !v)}
         >
           {open ? "Hide" : "Show"}
         </button>
@@ -1914,47 +1999,57 @@ function LiveScoresPanel({ state, onImport }) {
 
       {open && (
         <div style={{ marginTop:12 }}>
-          {loading && <div className="dim small">Fetching results…</div>}
-          {error   && <div className="err" style={{ marginTop:8 }}>{error}</div>}
-          {!loading && !error && fixtures.length === 0 && (
-            <div className="dim small">No finished matches found in the last 3 days.</div>
-          )}
-          {!loading && fixtures.length > 0 && (
+
+          {liveMatches.length > 0 && (
             <>
-              {fixtures.map(m => {
-                const hId  = apiTeamId(m.homeTeam);
-                const aId  = apiTeamId(m.awayTeam);
-                const hT   = hId ? TEAM[hId] : { name: m.homeTeam, flag: "🏳" };
-                const aT   = aId ? TEAM[aId] : { name: m.awayTeam, flag: "🏳" };
-                const isNew = hId && aId && !existingPairs.has([hId,aId].sort().join("|"));
+              <div className="dim small" style={{ marginBottom:6 }}>Live now — updates every minute</div>
+              {liveMatches.map(m => {
+                const hId = apiTeamId(m.homeTeam);
+                const aId = apiTeamId(m.awayTeam);
+                const hT  = hId ? TEAM[hId] : { name: m.homeTeam, flag: "🏳" };
+                const aT  = aId ? TEAM[aId] : { name: m.awayTeam, flag: "🏳" };
                 return (
                   <div key={m.id} className="ls-row">
-                    <span className="mstage mono" style={{ fontSize:11 }}>
-                      GRP
+                    <span className="mstage mono" style={{ fontSize:11, color:"var(--eng-red,#cf1b1b)" }}>
+                      {m.displayClock || 'LIVE'}
                     </span>
+                    <span className="ls-teams">
+                      {hT.flag} {hT.name}{" "}
+                      <strong className="mono">{m.homeScore ?? 0}–{m.awayScore ?? 0}</strong>{" "}
+                      {aT.name} {aT.flag}
+                    </span>
+                    <span className="ls-new" style={{ background:"#c62828", color:"#fff" }}>live</span>
+                  </div>
+                );
+              })}
+            </>
+          )}
+
+          {newFinished.length > 0 && (
+            <>
+              <div className="dim small" style={{ marginBottom:6, marginTop: liveMatches.length > 0 ? 12 : 0 }}>
+                Finished — not yet logged
+              </div>
+              {newFinished.map(m => {
+                const hId = apiTeamId(m.homeTeam);
+                const aId = apiTeamId(m.awayTeam);
+                const hT  = hId ? TEAM[hId] : { name: m.homeTeam, flag: "🏳" };
+                const aT  = aId ? TEAM[aId] : { name: m.awayTeam, flag: "🏳" };
+                return (
+                  <div key={m.id} className="ls-row">
+                    <span className="mstage mono" style={{ fontSize:11 }}>FT</span>
                     <span className="ls-teams">
                       {hT.flag} {hT.name}{" "}
                       <strong className="mono">{m.homeScore}–{m.awayScore}</strong>{" "}
                       {aT.name} {aT.flag}
                     </span>
-                    {isNew && <span className="ls-new">new</span>}
+                    <span className="ls-new">new</span>
                   </div>
                 );
               })}
-              {newFixtures.length > 0 && (
-                <button
-                  className="btn-primary"
-                  style={{ marginTop:12 }}
-                  onClick={importAll}
-                >
-                  Import {newFixtures.length} new result{newFixtures.length !== 1 ? "s" : ""} into paste box
-                </button>
-              )}
-              {newFixtures.length === 0 && (
-                <div className="dim small" style={{ marginTop:8 }}>
-                  All fetched results are already logged ✓
-                </div>
-              )}
+              <button className="btn-primary" style={{ marginTop:12 }} onClick={importNew}>
+                Import {newFinished.length} result{newFinished.length !== 1 ? "s" : ""} into paste box
+              </button>
             </>
           )}
         </div>
@@ -1963,7 +2058,7 @@ function LiveScoresPanel({ state, onImport }) {
   );
 }
 
-function MatchesView({ state, stats, commit, unlocked, tryUnlock, addResultsToAll }) {
+function MatchesView({ state, stats, commit, unlocked, tryUnlock, addResultsToAll, espnMatches = [] }) {
   const [form, setForm]       = useState(EMPTY_FORM);
   const [editing, setEditing] = useState(null);
   const [err, setErr]         = useState("");
@@ -2063,7 +2158,7 @@ function MatchesView({ state, stats, commit, unlocked, tryUnlock, addResultsToAl
 
   return (
     <div className="pane">
-      <LiveScoresPanel state={state} onImport={handleLiveImport} />
+      <LiveScoresPanel state={state} espnMatches={espnMatches} onImport={handleLiveImport} />
       <div className="card">
         <div className="card-title">{editing ? "Edit result" : "Add result"}</div>
         <div className="frow">

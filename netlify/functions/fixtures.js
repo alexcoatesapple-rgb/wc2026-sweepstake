@@ -43,20 +43,29 @@ exports.handler = async (event) => {
       return true;
     });
 
-    // Normalise into a simple shape the frontend can use
     const matches = events.map((e) => {
       const comp = e.competitions[0];
       const home = comp.competitors.find((c) => c.homeAway === "home");
       const away = comp.competitors.find((c) => c.homeAway === "away");
+
+      // Count red cards from competition details (not available in competitor statistics)
+      const details = comp.details || [];
+      const redCardsHome = details.filter(d => d.redCard && d.team?.id === home.team.id).length;
+      const redCardsAway = details.filter(d => d.redCard && d.team?.id === away.team.id).length;
+
       return {
         id: e.id,
         date: e.date,
-        status: e.status.type.description,   // e.g. "Final", "In Progress", "Scheduled"
-        statusState: e.status.type.state,    // "post", "in", "pre"
+        status: e.status.type.description,    // "Full Time", "First Half", "Scheduled", …
+        statusState: e.status.type.state,     // "post", "in", "pre"
+        displayClock: e.status.displayClock,  // "45'+2'", "90'", "0'"
+        period: e.status.period,              // 1 = first half, 2 = second half / ET
         homeTeam: home.team.displayName,
         homeScore: home.score ?? null,
         awayTeam: away.team.displayName,
         awayScore: away.score ?? null,
+        redCardsHome,
+        redCardsAway,
         round: e.season?.slug ?? null,
       };
     });
