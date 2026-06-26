@@ -202,19 +202,29 @@ function apiFixturesToPasteText(matches) {
 
 // Derive group winners + group-stage eliminations from the ESPN standings feed
 // (the /standings function's `{ groups }` payload). Only acts on COMPLETED groups
-// so a winner/exit is never guessed mid-group. ESPN's own `advanced` flag decides
-// who goes through — including the best third-placed teams — so this never
-// reimplements that tiebreaker. Returns id→true maps + any ESPN names we couldn't
-// map (golden rule: an unmapped team would otherwise vanish silently).
+// so a winner/exit is never guessed mid-group. Returns id→true maps + any ESPN
+// names we couldn't map (golden rule: an unmapped team would otherwise vanish
+// silently).
+//
+// Elimination is deliberately conservative because eliminations are STICKY (the
+// merge never clears them). We only mark a team out when it is *certainly* out:
+//   - rank 4 of its group — 4th of 4 never qualifies, decidable per-group; OR
+//   - any non-advanced team once EVERY group is complete — because WC26 sends the
+//     8 best third-placed teams through, and that isn't settled until all groups
+//     finish. Marking a not-yet-decided 3rd-placed team out early (on ESPN's
+//     interim `advanced` flag) would wrongly, and permanently, eliminate a team
+//     that still qualifies.
 function deriveFromStandings(groups) {
   const winners = {}, eliminated = {}, unmapped = [];
-  for (const g of groups || []) {
+  const list = groups || [];
+  const allComplete = list.length > 0 && list.every(g => g.complete);
+  for (const g of list) {
     if (!g.complete) continue;
     for (const t of g.teams || []) {
       const id = apiTeamId(t.name);
       if (!id) { unmapped.push(t.name); continue; }
       if (t.rank === 1) winners[id] = true;
-      if (!t.advanced) eliminated[id] = true;
+      if (t.rank === 4 || (allComplete && !t.advanced)) eliminated[id] = true;
     }
   }
   return { winners, eliminated, unmapped };
@@ -1986,8 +1996,8 @@ function TeamsView({ state, stats, commit, unlocked, tryUnlock }) {
   return (
     <div className="pane">
       <div className="pane-note dim">
-        Tap ★ when a team wins its group (+{stats.sc.groupWin} pts).
-        Knockout exits are marked automatically; use ✕ for group-stage eliminations.
+        Group winners (★, +{stats.sc.groupWin} pts) and exits are filled in
+        automatically from live results. Tap ★ or ✕ to override.
       </div>
       <div className="tlist">
         {rows.map(({ t, pts, owner, out }) => (

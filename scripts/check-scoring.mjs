@@ -21,12 +21,15 @@ function grab(label, re) {
   return m[0];
 }
 const code =
-  grab("DEFAULT_SCORING", /const DEFAULT_SCORING = \{[\s\S]*?\};/) + "\n" +
-  grab("koWinner",        /function koWinner[\s\S]*?\n\}/) + "\n" +
-  grab("teamMatchPts",    /function teamMatchPts[\s\S]*?\n\}/) + "\n" +
-  grab("buildStats",      /function buildStats[\s\S]*?\n\}/) + "\n" +
-  "return { DEFAULT_SCORING, koWinner, teamMatchPts, buildStats };";
-const { DEFAULT_SCORING: SC, koWinner, teamMatchPts, buildStats } = new Function(code)();
+  grab("DEFAULT_SCORING",   /const DEFAULT_SCORING = \{[\s\S]*?\};/) + "\n" +
+  grab("API_TEAM_MAP",      /const API_TEAM_MAP = \{[\s\S]*?\};/) + "\n" +
+  grab("apiTeamId",         /function apiTeamId[\s\S]*?\n\}/) + "\n" +
+  grab("koWinner",          /function koWinner[\s\S]*?\n\}/) + "\n" +
+  grab("teamMatchPts",      /function teamMatchPts[\s\S]*?\n\}/) + "\n" +
+  grab("buildStats",        /function buildStats[\s\S]*?\n\}/) + "\n" +
+  grab("deriveFromStandings", /function deriveFromStandings[\s\S]*?\n\}/) + "\n" +
+  "return { DEFAULT_SCORING, koWinner, teamMatchPts, buildStats, deriveFromStandings };";
+const { DEFAULT_SCORING: SC, koWinner, teamMatchPts, buildStats, deriveFromStandings } = new Function(code)();
 
 let passed = 0, failed = 0;
 const eq = (label, got, want) => {
@@ -105,6 +108,27 @@ const tie = buildStats({
 });
 eq("tie: both leaders rank 1", [tie.players[0].rank, tie.players[1].rank], [1, 1]);
 eq("tie: third is rank 3",     tie.players[2].rank, 3);
+
+// ---- deriveFromStandings (auto group winners + exits, B1 guard) -------------
+const G = (name, complete, teams) => ({ name, complete, teams });
+const T = (name, rank, advanced) => ({ name, rank, advanced });
+// Partial: one group done, one not → allComplete is false.
+const partial = deriveFromStandings([
+  G("A", true,  [T("Spain",1,true), T("France",2,true), T("Brazil",3,false), T("Japan",4,false)]),
+  G("B", false, [T("England",1,true), T("Germany",2,false), T("Croatia",3,false), T("Iran",4,false)]),
+]);
+eq("derive: group winner = rank 1",        partial.winners.esp, true);
+eq("derive: rank 4 eliminated",            partial.eliminated.jpn, true);
+eq("derive: rank 3 NOT out while groups pending (B1)", partial.eliminated.bra, undefined);
+eq("derive: incomplete group untouched",   [partial.winners.eng, partial.eliminated.ger], [undefined, undefined]);
+eq("derive: unmapped team skipped (no throw)", deriveFromStandings([G("Z",true,[T("Atlantis",1,false)])]).unmapped, ["Atlantis"]);
+// All groups complete → 3rd-placed resolved by ESPN advanced flag.
+const allDone = deriveFromStandings([
+  G("A", true, [T("Spain",1,true), T("France",2,true), T("Brazil",3,true),  T("Japan",4,false)]),
+  G("B", true, [T("England",1,true), T("Germany",2,true), T("Croatia",3,false), T("Iran",4,false)]),
+]);
+eq("derive: allComplete, advanced 3rd survives", allDone.eliminated.bra, undefined);
+eq("derive: allComplete, non-advanced 3rd out",  allDone.eliminated.cro, true);
 
 // ---------------------------------------------------------------------------
 console.log(`\nscoring check: ${passed} passed, ${failed} failed`);

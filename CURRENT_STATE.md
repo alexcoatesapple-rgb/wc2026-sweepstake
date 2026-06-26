@@ -28,8 +28,13 @@
   ESPN; browser E2E of the function still pending (needs `netlify dev` / deploy
   preview). Uncommitted as of 2026-06-26.
 - **Scoring regression test (#4)** — `scripts/check-scoring.mjs` (run via `npm
-  test`) exercises the real `koWinner` / `teamMatchPts` / `buildStats` from
-  `App.jsx`; 27 assertions, all passing. App code untouched (no extraction).
+  test`) exercises the real `koWinner` / `teamMatchPts` / `buildStats` /
+  `deriveFromStandings` from `App.jsx`; 34 assertions, all passing.
+- **Pre-deploy audit** — `AUDIT_2026-06-26.md`. Found + fixed **B1** (3rd-placed
+  teams were prematurely + stickily eliminated): `deriveFromStandings` now only
+  auto-eliminates rank-4 per group, plus non-advanced teams once ALL groups are
+  complete. Also fixed the stale Teams-tab helper copy. Deferred: read
+  amplification on load (I1), CJS-in-ESM function warning (I2).
 
 ## Known gotchas
 
