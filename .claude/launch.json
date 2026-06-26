@@ -6,6 +6,13 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
       "port": 5174
+    },
+    {
+      "name": "netlify",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["-y", "netlify-cli@latest", "dev", "--offline", "--framework", "#custom", "--command", "npm run dev -- --port 5190 --strictPort", "--target-port", "5190"],
+      "port": 8888,
+      "autoPort": false
     }
   ]
 }
