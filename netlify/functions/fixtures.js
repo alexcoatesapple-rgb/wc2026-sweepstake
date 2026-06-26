@@ -53,6 +53,12 @@ exports.handler = async (event) => {
       const redCardsHome = details.filter(d => d.redCard && d.team?.id === home.team.id).length;
       const redCardsAway = details.filter(d => d.redCard && d.team?.id === away.team.id).length;
 
+      // Real round/stage. ESPN puts it in competition notes (e.g.
+      // "Group A", "Round of 16", "Quarterfinal"). The season slug is
+      // NOT the round, so it must not be used here.
+      const noteHeadline =
+        (comp.notes || []).map(n => n.headline || n.text).filter(Boolean).join(" ");
+
       return {
         id: e.id,
         date: e.date,
@@ -66,7 +72,7 @@ exports.handler = async (event) => {
         awayScore: away.score ?? null,
         redCardsHome,
         redCardsAway,
-        round: e.season?.slug ?? null,
+        round: noteHeadline || e.season?.slug || null,
       };
     });
 

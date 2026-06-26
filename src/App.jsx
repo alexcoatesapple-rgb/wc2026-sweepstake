@@ -806,7 +806,10 @@ export default function App() {
         if (idx === -1) {
           merged.push(nr);
           changed = true;
-        } else if (updateExisting) {
+        } else if (updateExisting && merged[idx].id?.startsWith("espn_")) {
+          // Only auto-sync corrects results it placed itself. A result the
+          // organiser typed or pasted (id "m…" / "imp_…") is left alone so
+          // a manual fix is never silently reverted by an ESPN refresh.
           const er = merged[idx];
           // ESPN home/away may be reversed vs how this sweep stored teamA/teamB
           const flipped = er.teamA === nr.teamB;
