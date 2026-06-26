@@ -168,7 +168,7 @@ const API_TEAM_MAP = {
   "Türkiye":"tur","Turkey":"tur","Canada":"can","Austria":"aut","Sweden":"swe",
   "Ivory Coast":"civ","Cote d'Ivoire":"civ","Côte d'Ivoire":"civ","Czechia":"cze",
   "Czech Republic":"cze","Scotland":"sco","Australia":"aus","Paraguay":"par",
-  "Iran":"irn","Bosnia":"bih","Bosnia and Herzegovina":"bih","Saudi Arabia":"ksa",
+  "Iran":"irn","Bosnia":"bih","Bosnia and Herzegovina":"bih","Bosnia-Herzegovina":"bih","Saudi Arabia":"ksa",
   "Tunisia":"tun","Ghana":"gha","Egypt":"egy","Algeria":"alg","Uzbekistan":"uzb",
   "DR Congo":"cod","Congo DR":"cod","New Zealand":"nzl","Cape Verde":"cpv",
   "Jordan":"jor","South Africa":"rsa","Panama":"pan","Iraq":"irq","Qatar":"qat",
@@ -198,6 +198,37 @@ function apiFixturesToPasteText(matches) {
     const aName = TEAM[aId]?.name || m.awayTeam;
     return `GROUP: ${hName} ${m.homeScore ?? 0}-${m.awayScore ?? 0} ${aName}`;
   }).filter(Boolean).join("\n");
+}
+
+// Derive group winners + group-stage eliminations from the ESPN standings feed
+// (the /standings function's `{ groups }` payload). Only acts on COMPLETED groups
+// so a winner/exit is never guessed mid-group. ESPN's own `advanced` flag decides
+// who goes through — including the best third-placed teams — so this never
+// reimplements that tiebreaker. Returns id→true maps + any ESPN names we couldn't
+// map (golden rule: an unmapped team would otherwise vanish silently).
+function deriveFromStandings(groups) {
+  const winners = {}, eliminated = {}, unmapped = [];
+  for (const g of groups || []) {
+    if (!g.complete) continue;
+    for (const t of g.teams || []) {
+      const id = apiTeamId(t.name);
+      if (!id) { unmapped.push(t.name); continue; }
+      if (t.rank === 1) winners[id] = true;
+      if (!t.advanced) eliminated[id] = true;
+    }
+  }
+  return { winners, eliminated, unmapped };
+}
+
+// Union derived facts into a sweep's stored maps. Additive ONLY — never clears a
+// flag, so a manual override is preserved. Returns the next maps + a changed flag.
+function mergeDerived(st, winners, eliminated) {
+  const groupWinners = { ...(st.groupWinners || {}) };
+  const elim = { ...(st.eliminated || {}) };
+  let changed = false;
+  for (const id in winners) if (!groupWinners[id]) { groupWinners[id] = true; changed = true; }
+  for (const id in eliminated) if (!elim[id]) { elim[id] = true; changed = true; }
+  return { groupWinners, eliminated: elim, changed };
 }
 
 const DEFAULT_SCORING = {
@@ -754,9 +785,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Auto-apply finished ESPN results whenever a sweep is (re-)loaded.
+  // Auto-apply finished ESPN results, then group winners / exits, whenever a
+  // sweep is (re-)loaded. Sequenced: standings sync re-reads each sweep fresh
+  // AFTER the results sync has saved, so it never clobbers the new results.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { if (sweepId) autoSyncFromESPN(); }, [sweepId]);
+  useEffect(() => {
+    if (!sweepId) return;
+    (async () => { await autoSyncFromESPN(); await autoSyncStandings(); })();
+  }, [sweepId]);
 
   function openSweep(id, st) {
     setSweepId(id);
@@ -868,6 +904,31 @@ export default function App() {
           }];
         });
       await addResultsToAll(newResults, { updateExisting: true });
+    } catch (_) {}
+  }
+
+  // Pull ESPN group standings and write derived group winners + group-stage
+  // exits to EVERY sweep this device knows (the same fact applies to all). Each
+  // sweep is loaded fresh from the server before merging, so this never clobbers
+  // results another sync just wrote; the merge is additive (manual flags survive).
+  async function autoSyncStandings() {
+    try {
+      const res = await fetch('/.netlify/functions/standings');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.error || !data.groups) return;
+      const { winners, eliminated, unmapped } = deriveFromStandings(data.groups);
+      if (unmapped.length) console.warn('[standings] unmapped ESPN teams:', unmapped);
+      if (!Object.keys(winners).length && !Object.keys(eliminated).length) return;
+      for (const k of loadKnownSweeps()) {
+        const hit = await loadById(k.id);
+        if (!hit) continue;
+        const m = mergeDerived(hit.state, winners, eliminated);
+        if (!m.changed) continue;
+        const nextState = { ...hit.state, groupWinners: m.groupWinners, eliminated: m.eliminated };
+        await saveSweep(k.id, nextState);
+        if (k.id === sweepId) setState(nextState);   // refresh the open sweep's UI
+      }
     } catch (_) {}
   }
 

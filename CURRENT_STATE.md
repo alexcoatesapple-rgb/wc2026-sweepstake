@@ -19,8 +19,17 @@
 
 ## In flight / uncommitted
 
-- Working-tree changes to `netlify/functions/fixtures.js` and `src/App.jsx`
-  (live-score sync work — uncommitted as of harness setup, 2026-06-26).
+- **Auto group winners + exits (#3)** — new `netlify/functions/standings.js` proxies
+  ESPN group standings; `deriveFromStandings` + `mergeDerived` (App.jsx) turn that
+  into group winners (rank 1) and group-stage exits (ESPN `advanced` flag), only for
+  *completed* groups. `autoSyncStandings()` broadcasts them to every remembered
+  sweep on load. Manual toggles remain as override (merge is additive). Also added
+  the `"Bosnia-Herzegovina"` alias to `API_TEAM_MAP`. Logic verified against live
+  ESPN; browser E2E of the function still pending (needs `netlify dev` / deploy
+  preview). Uncommitted as of 2026-06-26.
+- **Scoring regression test (#4)** — `scripts/check-scoring.mjs` (run via `npm
+  test`) exercises the real `koWinner` / `teamMatchPts` / `buildStats` from
+  `App.jsx`; 27 assertions, all passing. App code untouched (no extraction).
 
 ## Known gotchas
 

@@ -54,6 +54,10 @@ sweep, and one path fans a write out to *other* sweeps on the device.
 - `commit(next)` (in `App()`) — the sanctioned state-write wrapper.
 - `addResultsToAll(newResults, {updateExisting})` — merge into current sweep AND
   broadcast brand-new results to every other remembered sweep.
+- `autoSyncStandings()` — derive group winners + group-stage exits from ESPN
+  standings and broadcast them to every remembered sweep (loads each fresh first,
+  so it never clobbers results). Uses the pure `mergeDerived` (additive union —
+  never clears a manual flag) and `deriveFromStandings` (completed groups only).
 
 When you add a privileged path or change RLS, add a line here on the way out
 (closeout).

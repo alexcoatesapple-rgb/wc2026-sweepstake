@@ -54,7 +54,11 @@ redsB, pensWinner, at, live? }`. `stage` is a `STAGE` id (`GROUP`, `R32`, `R16`,
   current state and hand it to `commit`.
 - **Scoring is centralized** in `teamMatchPts` (one team in one match) and
   `buildStats` (the whole leaderboard, elimination, ranks). UI reads what these
-  return; it never recomputes points inline.
+  return; it never recomputes points inline. **Run `npm test`
+  (`scripts/check-scoring.mjs`) after any change to `koWinner` / `teamMatchPts` /
+  `buildStats` / `DEFAULT_SCORING`** — it pulls those real functions out of
+  `App.jsx` and asserts the scoring rules. If you rename/move one, update the
+  script's `grab` patterns.
 - **Tolerant parsing**: `parseResultsText` accepts hyphen/en/em dashes
   (`[-–—]`), `#`/`/` comment lines, optional pens and reds, and dedupes. Match its
   leniency if you extend the format.
@@ -70,6 +74,13 @@ redsB, pensWinner, at, live? }`. `stage` is a `STAGE` id (`GROUP`, `R32`, `R16`,
 - **`fixtures.js` ↔ the ingest in `App.jsx`.** The Netlify function shapes the
   ESPN payload (`statusState`, `round` from notes, red-card counts);
   `autoSyncFromESPN` consumes that exact shape. Change one side, change the other.
+- **`standings.js` ↔ `deriveFromStandings` in `App.jsx`.** The standings function
+  returns `{ groups: [{ name, complete, teams: [{ name, rank, advanced }] }] }`;
+  `deriveFromStandings` consumes that exact shape to set group winners (rank 1) and
+  group-stage exits (`advanced === false`), only for `complete` groups. `advanced`
+  is ESPN's own call (it resolves the best-third-placed teams) — don't reimplement
+  it. `autoSyncStandings` then broadcasts the derived facts to every remembered
+  sweep, loading each fresh AFTER the results sync so it never clobbers new results.
 - **Two paths write results**: `parseResultsText` (manual/import) and
   `autoSyncFromESPN` (machine). They share the `addResultsToAll` merge — keep the
   identity rule (stage + unordered pair) and the `espn_`-only overwrite gate intact
