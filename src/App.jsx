@@ -289,6 +289,93 @@ function resolveBracket(groups, thirdCombo) {
   return R32_BRACKET.map(t => ({ m: t.m, a: side(t.m, t.a), b: side(t.m, t.b) }));
 }
 
+// Knockout flow after the R32. Each side feeds from the WINNER (`w`) or LOSER
+// (`l`) of an earlier match number, so every later slot fills as results land.
+// `stage` drives the result lookup. FIFA's published tree (validated: the two SF
+// subtrees are disjoint and together cover all 16 R32 ties).
+const KO_FLOW = [
+  { m: 89,  stage: "R16",   a: { w: 74 },  b: { w: 77 } },
+  { m: 90,  stage: "R16",   a: { w: 73 },  b: { w: 75 } },
+  { m: 91,  stage: "R16",   a: { w: 76 },  b: { w: 78 } },
+  { m: 92,  stage: "R16",   a: { w: 79 },  b: { w: 80 } },
+  { m: 93,  stage: "R16",   a: { w: 83 },  b: { w: 84 } },
+  { m: 94,  stage: "R16",   a: { w: 81 },  b: { w: 82 } },
+  { m: 95,  stage: "R16",   a: { w: 86 },  b: { w: 88 } },
+  { m: 96,  stage: "R16",   a: { w: 85 },  b: { w: 87 } },
+  { m: 97,  stage: "QF",    a: { w: 89 },  b: { w: 90 } },
+  { m: 98,  stage: "QF",    a: { w: 93 },  b: { w: 94 } },
+  { m: 99,  stage: "QF",    a: { w: 91 },  b: { w: 92 } },
+  { m: 100, stage: "QF",    a: { w: 95 },  b: { w: 96 } },
+  { m: 101, stage: "SF",    a: { w: 97 },  b: { w: 98 } },
+  { m: 102, stage: "SF",    a: { w: 99 },  b: { w: 100 } },
+  { m: 103, stage: "THIRD", a: { l: 101 }, b: { l: 102 } },
+  { m: 104, stage: "FINAL", a: { w: 101 }, b: { w: 102 } },
+];
+const KO_BY_NUM = new Map(KO_FLOW.map(d => [d.m, d]));
+
+// Two-sided tree layout (match numbers top→bottom, ordered so a pure flex
+// `space-around` centres each match between its two feeders). Left and right
+// halves are the two SF subtrees; centre holds the Final + third-place game.
+const BRACKET_COLUMNS = {
+  left: [
+    { stage: "R32", ms: [74, 77, 73, 75, 83, 84, 81, 82] },
+    { stage: "R16", ms: [89, 90, 93, 94] },
+    { stage: "QF",  ms: [97, 98] },
+    { stage: "SF",  ms: [101] },
+  ],
+  center: [104], // third-place game (103) renders separately below the tree
+  right: [
+    { stage: "SF",  ms: [102] },
+    { stage: "QF",  ms: [99, 100] },
+    { stage: "R16", ms: [91, 92, 95, 96] },
+    { stage: "R32", ms: [76, 78, 79, 80, 86, 88, 85, 87] },
+  ],
+};
+
+// ESPN R32-fixture override for a third-place slot: fill/correct it from the real
+// opponent of its (deterministic) winner partner. `byTeam`: team id → R32 opponent.
+function overrideThird(s, partner, byTeam) {
+  if (s.kind !== "third") return s;
+  const opp = partner.teamId ? byTeam.get(partner.teamId) : null;
+  return opp ? { ...s, teamId: opp } : s;
+}
+
+// Resolve the WHOLE knockout tree (matches 73–104). R32 teams come from standings
+// + the realised third combo + ESPN R32 override (`byTeam`); every later slot
+// fills from the winner (SF losers → third place) of its feeders. Winners
+// propagate only from FINISHED matches (`resultIndex` entry with `done`) — a live
+// match never advances a team. Returns Map(matchNumber → resolved match).
+function resolveBracketTree(groups, thirdCombo, byTeam, resultIndex) {
+  const r32ByNum = new Map(resolveBracket(groups, thirdCombo).map(t => [t.m, t]));
+  const out = new Map();
+  const winnerOf = {}, loserOf = {};
+  const keyFor = (stage, a, b) => `${stage}|${[a, b].sort().join("|")}`;
+  const feeder = (f) => f.w != null
+    ? { teamId: winnerOf[f.w] ?? null, label: `Winner M${f.w}` }
+    : { teamId: loserOf[f.l] ?? null, label: `Loser M${f.l}` };
+
+  // Ascending order guarantees every feeder is resolved before its dependants.
+  for (let m = 73; m <= 104; m++) {
+    let stage, a, b;
+    if (r32ByNum.has(m)) {
+      const t = r32ByNum.get(m);
+      stage = "R32"; a = overrideThird(t.a, t.b, byTeam); b = overrideThird(t.b, t.a, byTeam);
+    } else {
+      const def = KO_BY_NUM.get(m);
+      stage = def.stage; a = feeder(def.a); b = feeder(def.b);
+    }
+    const res = (a.teamId && b.teamId) ? resultIndex.get(keyFor(stage, a.teamId, b.teamId)) : null;
+    let winner = null, loser = null;
+    if (res && res.done) {
+      winner = koWinner(res) || null;
+      loser = winner ? (winner === res.teamA ? res.teamB : res.teamA) : null;
+    }
+    winnerOf[m] = winner; loserOf[m] = loser;
+    out.set(m, { m, stage, a, b, winner, loser, result: res || null });
+  }
+  return out;
+}
+
 // Union derived facts into a sweep's stored maps. Additive ONLY — never clears a
 // flag, so a manual override is preserved. Returns the next maps + a changed flag.
 function mergeDerived(st, winners, eliminated) {
@@ -1585,11 +1672,12 @@ function DrawReveal({ state, onDone }) {
   );
 }
 
-/* ---- Knockout bracket (Round of 32) ---- */
-// Tonight's realised best-third combination (FIFA Annexe C) — keyed by R32 match
-// number → the group whose 3rd-placed team fills that slot. null until all 12
-// groups finish and the 8 qualifying thirds are known; fill it then (one row,
-// ~8 entries) and the third slots resolve. ESPN R32 fixtures override regardless.
+/* ---- Knockout bracket (full tree) ---- */
+// Realised best-third combination (FIFA Annexe C) — keyed by R32 match number →
+// the group whose 3rd-placed team fills that slot. null until the 8 qualifying
+// thirds are known; fill it then (one ~8-entry row) and the third slots resolve.
+// ESPN R32 fixtures override regardless. Everything past the R32 propagates from
+// match winners, so it needs no config.
 const R32_THIRD_COMBO = null; // e.g. { 74:"B", 77:"D", 79:"C", 80:"E", 81:"F", 82:"H", 85:"G", 87:"I" }
 
 function BracketView({ state, stats, espnMatches = [] }) {
@@ -1611,107 +1699,106 @@ function BracketView({ state, stats, espnMatches = [] }) {
     return () => { alive = false; clearInterval(id); };
   }, []);
 
-  const ties = useMemo(() => resolveBracket(groups, R32_THIRD_COMBO), [groups]);
-
-  // ESPN R32 fixtures/results are the source of truth. `byTeam` maps each team to
-  // its real R32 opponent — used to fill (and override) third-place slots, which
-  // is what makes the projection self-heal. `actual` carries status + scores for
-  // the result overlay; scores are kept only once a match has actually started
-  // (ESPN reports "0"/null pre-kickoff, which must not render as a 0–0 result).
-  const { actual, byTeam } = useMemo(() => {
-    const actual = new Map(), byTeam = new Map();
-    const add = (a, b, sa, sb, done, started) => {
-      actual.set([a, b].sort().join('|'), { scores: started ? { [a]: sa, [b]: sb } : null, done });
-      byTeam.set(a, b); byTeam.set(b, a);
-    };
+  // Result index across EVERY stage (keyed `${stage}|${sortedPair}`) + the R32
+  // `byTeam` opponent map for the third-place override. Committed results win over
+  // ESPN (they carry pens winners + manual fixes). Scores are kept only once a
+  // match has started — ESPN reports "0"/null pre-kickoff.
+  const { resultIndex, byTeam } = useMemo(() => {
+    const resultIndex = new Map(), byTeam = new Map();
+    const key = (stage, a, b) => `${stage}|${[a, b].sort().join('|')}`;
     for (const m of espnMatches) {
-      if (apiRoundToStage(m.round) !== 'R32') continue;
+      const stage = apiRoundToStage(m.round);
       const a = apiTeamId(m.homeTeam), b = apiTeamId(m.awayTeam);
       if (!a || !b) continue;
-      add(a, b, Number(m.homeScore), Number(m.awayScore), m.statusState === 'post', m.statusState === 'in' || m.statusState === 'post');
+      const started = m.statusState === 'in' || m.statusState === 'post';
+      resultIndex.set(key(stage, a, b), { teamA: a, teamB: b, scoreA: Number(m.homeScore), scoreB: Number(m.awayScore), pensWinner: null, done: m.statusState === 'post', started });
+      if (stage === 'R32') { byTeam.set(a, b); byTeam.set(b, a); }
     }
     for (const r of state.results || []) {
-      if (r.stage !== 'R32' || !r.teamA || !r.teamB) continue;
-      add(r.teamA, r.teamB, r.scoreA, r.scoreB, !r.live, true);
+      if (!r.teamA || !r.teamB) continue;
+      resultIndex.set(key(r.stage, r.teamA, r.teamB), { teamA: r.teamA, teamB: r.teamB, scoreA: r.scoreA, scoreB: r.scoreB, pensWinner: r.pensWinner || null, done: !r.live, started: true });
+      if (r.stage === 'R32') { byTeam.set(r.teamA, r.teamB); byTeam.set(r.teamB, r.teamA); }
     }
-    return { actual, byTeam };
+    return { resultIndex, byTeam };
   }, [espnMatches, state.results]);
 
-  // Apply the ESPN override: a third-place slot takes the real opponent of its
-  // (deterministic) winner partner from the live fixture, beating the projected
-  // combo — so a missing or mis-transcribed R32_THIRD_COMBO corrects itself.
-  const view = useMemo(() => {
-    const override = (s, partner) => {
-      if (s.kind !== "third") return s;
-      const espnOpp = partner.teamId ? byTeam.get(partner.teamId) : null;
-      return espnOpp ? { ...s, teamId: espnOpp } : s;
-    };
-    return ties.map(t => ({ m: t.m, a: override(t.a, t.b), b: override(t.b, t.a) }));
-  }, [ties, byTeam]);
+  const tree = useMemo(
+    () => resolveBracketTree(groups, R32_THIRD_COMBO, byTeam, resultIndex),
+    [groups, byTeam, resultIndex]
+  );
 
   const owned = stats.ownedTeams;
-  const elim = stats.eliminated;
-  const hasActual = actual.size > 0;
-  const allActual = actual.size >= 16;
-  const resolved = view.filter(t => t.a.teamId && t.b.teamId).length;
-  const ownedIn = view.reduce((n, t) => n + (owned.has(t.a.teamId) ? 1 : 0) + (owned.has(t.b.teamId) ? 1 : 0), 0);
+  const decided = [...tree.values()].filter(t => t.winner).length;
+  const ownedAlive = [...owned].filter(id => !stats.eliminated.has(id)).length;
 
-  function renderSide(s, act, winner) {
-    if (!s.teamId) return <div className="bkt-team bkt-ph">{s.label}</div>;
-    const t = TEAM[s.teamId];
-    const sc = act?.scores?.[s.teamId];
+  function renderSide(side, t) {
+    if (!side.teamId) return <div className="bkt-team bkt-ph">{side.label}</div>;
+    const team = TEAM[side.teamId];
+    const res = t.result;
+    const sc = res?.started ? (side.teamId === res.teamA ? res.scoreA : res.scoreB) : undefined;
     return (
-      <div className={cls("bkt-team", owned.has(s.teamId) && "bkt-own", elim.has(s.teamId) && "bkt-dead", winner === s.teamId && "bkt-win")}>
-        <span className="bkt-flag">{t.flag}</span>
-        <span className="bkt-name">{t.name}</span>
-        {owned.has(s.teamId) && <span className="bkt-dot" title="Your team">●</span>}
+      <div className={cls("bkt-team", owned.has(side.teamId) && "bkt-own", t.winner === side.teamId && "bkt-win", t.loser === side.teamId && "bkt-dead")}>
+        <span className="bkt-flag">{team.flag}</span>
+        <span className="bkt-name">{team.name}</span>
+        {owned.has(side.teamId) && <span className="bkt-dot" title="Your team">●</span>}
+        {res?.pensWinner === side.teamId && <span className="bkt-pen" title="Won on penalties">p</span>}
         {Number.isFinite(sc) && <span className="bkt-score">{sc}</span>}
       </div>
     );
   }
 
+  function renderMatch(num, sideClass) {
+    const t = tree.get(num);
+    if (!t) return null;
+    const label = t.stage === "FINAL" ? "Final" : t.stage === "THIRD" ? "3rd place" : `M${num}`;
+    return (
+      <div key={num} className={cls("bkt-tie", `bkt-${sideClass}`, t.stage === "FINAL" && "bkt-final",
+        (owned.has(t.a.teamId) || owned.has(t.b.teamId)) && "bkt-tie-own")}>
+        <div className="bkt-num"><span>{label}</span></div>
+        {renderSide(t.a, t)}
+        {renderSide(t.b, t)}
+      </div>
+    );
+  }
+
+  const column = (col, sideClass, keyPrefix) => (
+    <div className="bkt-col" key={keyPrefix + col.stage}>
+      <div className="bkt-colhead">{STAGE[col.stage]?.short || col.stage}</div>
+      <div className="bkt-colbody">{col.ms.map(num => renderMatch(num, sideClass))}</div>
+    </div>
+  );
+
   return (
     <div className="bracket-wrap">
       <div className="board-eyebrow">
-        <span className="board-eyebrow-label">Round of 32 · {hasActual ? "Confirmed" : "Projected"}</span>
+        <span className="board-eyebrow-label">Knockout bracket</span>
         <div className="board-eyebrow-line" />
-        <span className="board-eyebrow-right">{resolved}/16 set · {ownedIn} of yours</span>
+        <span className="board-eyebrow-right">{decided}/32 played · {ownedAlive} of yours alive</span>
       </div>
 
       <div className="bkt-note">
-        {hasActual
-          ? "Fixtures confirmed from ESPN. ● marks your teams."
-          : "Auto-filled from group results — winners & runners-up lock as each group ends. The 8 third-place slots resolve once all 12 groups finish. ● marks your teams."}
+        Auto-fills as results land — group winners &amp; runners-up seed the Round of 32,
+        then every winner advances through the tree (losing semi-finalists drop into the
+        third-place game). ● marks your teams · scroll across for later rounds.
       </div>
 
       {!loaded ? (
         <div className="notice">Loading the bracket…</div>
       ) : (
-        <div className="bkt-grid">
-          {view.map(t => {
-            const aId = t.a.teamId, bId = t.b.teamId;
-            const pairKey = aId && bId ? [aId, bId].sort().join('|') : null;
-            const act = pairKey ? actual.get(pairKey) : null;
-            let winner = null;
-            if (act?.done && act.scores) {
-              const sa = act.scores[aId], sb = act.scores[bId];
-              if (sa > sb) winner = aId; else if (sb > sa) winner = bId;
-            }
-            const tag = !pairKey ? null : act ? "ok" : allActual ? "warn" : "pred";
-            return (
-              <div key={t.m} className={cls("bkt-tie", (owned.has(aId) || owned.has(bId)) && "bkt-tie-own")}>
-                <div className="bkt-num">
-                  <span>Match {t.m}</span>
-                  {tag === "ok"   && <span className="bkt-tag bkt-tag-ok">ESPN ✓</span>}
-                  {tag === "warn" && <span className="bkt-tag bkt-tag-warn">ESPN differs</span>}
-                  {tag === "pred" && <span className="bkt-tag bkt-tag-pred">Projected</span>}
-                </div>
-                {renderSide(t.a, act, winner)}
-                {renderSide(t.b, act, winner)}
-              </div>
-            );
-          })}
-        </div>
+        <>
+          <div className="bkt-tree">
+            {BRACKET_COLUMNS.left.map(col => column(col, "left", "L"))}
+            <div className="bkt-col bkt-col-center" key="center">
+              <div className="bkt-colhead">Final</div>
+              <div className="bkt-colbody">{BRACKET_COLUMNS.center.map(num => renderMatch(num, "center"))}</div>
+            </div>
+            {BRACKET_COLUMNS.right.map(col => column(col, "right", "R"))}
+          </div>
+          <div className="bkt-thirdplace">
+            <div className="bkt-colhead bkt-3rd-head">Third-place play-off</div>
+            {renderMatch(103, "center")}
+          </div>
+        </>
       )}
     </div>
   );
@@ -3122,29 +3209,34 @@ function Styles() {
       .chip-pts      { font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
       .chip-pts-plain { font-weight: 700; color: var(--tnum); font-variant-numeric: tabular-nums; }
 
-      /* Knockout bracket */
+      /* Knockout bracket — two-sided tree */
       .bracket-wrap   { padding: 4px 0 24px; }
       .bkt-note       { font-size: 12px; color: var(--muted); margin: 10px 0 16px; line-height: 1.5; }
-      .bkt-grid       { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-      .bkt-tie        { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+      .bkt-tree       { display: flex; align-items: stretch; gap: 16px; overflow-x: auto; padding: 4px 2px 14px; min-height: 640px; }
+      .bkt-col        { display: flex; flex-direction: column; flex: 0 0 auto; width: 152px; }
+      .bkt-col-center { width: 172px; }
+      .bkt-colhead    { font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--faint); font-weight: 700; text-align: center; padding-bottom: 8px; }
+      .bkt-colbody    { flex: 1; display: flex; flex-direction: column; justify-content: space-around; }
+      .bkt-tie        { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; }
       .bkt-tie-own    { border-color: var(--accent-line); box-shadow: inset 0 0 0 1px var(--accent-line); }
-      .bkt-num        { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); font-weight: 700; margin-bottom: 4px; }
-      .bkt-tag        { font-size: 8.5px; letter-spacing: .06em; padding: 1px 5px; border-radius: 3px; font-weight: 700; white-space: nowrap; }
-      .bkt-tag-pred   { color: var(--muted); background: var(--track); }
-      .bkt-tag-ok     { color: var(--win); background: #e7f3ec; }
-      .bkt-tag-warn   { color: var(--on-accent); background: var(--signal); }
-      .bkt-team       { display: flex; align-items: center; gap: 7px; padding: 5px 2px; font-size: 13.5px; font-weight: 600; }
+      .bkt-final      { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+      .bkt-num        { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); font-weight: 700; margin-bottom: 3px; }
+      .bkt-final .bkt-num { color: var(--accent); }
+      .bkt-team       { display: flex; align-items: center; gap: 6px; padding: 4px 1px; font-size: 13px; font-weight: 600; }
       .bkt-team + .bkt-team { border-top: 1px solid var(--line); }
-      .bkt-flag       { font-size: 15px; line-height: 1; }
+      .bkt-flag       { font-size: 14px; line-height: 1; }
       .bkt-name       { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .bkt-dot        { color: var(--accent); font-size: 9px; line-height: 1; }
-      .bkt-score      { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--tnum); min-width: 14px; text-align: right; }
-      .bkt-ph         { color: var(--muted); font-style: italic; font-weight: 500; font-size: 12px; }
+      .bkt-dot        { color: var(--accent); font-size: 8px; line-height: 1; }
+      .bkt-pen        { font-size: 8.5px; font-weight: 700; color: var(--win); background: #e7f3ec; border-radius: 2px; padding: 0 3px; }
+      .bkt-score      { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--tnum); min-width: 12px; text-align: right; }
+      .bkt-ph         { color: var(--muted); font-style: italic; font-weight: 500; font-size: 11.5px; }
       .bkt-own        { color: var(--accent); }
-      .bkt-win .bkt-name { color: var(--win); }
+      .bkt-win .bkt-name  { color: var(--win); }
+      .bkt-win .bkt-score { color: var(--win); }
       .bkt-dead       { opacity: .42; }
       .bkt-dead .bkt-name { text-decoration: line-through; text-decoration-color: var(--muted); }
-      @media (max-width: 560px) { .bkt-grid { grid-template-columns: 1fr; } }
+      .bkt-thirdplace { margin-top: 14px; max-width: 230px; }
+      .bkt-3rd-head   { text-align: left; }
 
       /* Commentary & results */
       .board-commentary    { margin-top: 18px; display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; background: var(--card); border: 1px solid var(--line); border-radius: 4px; animation: rise .4s .3s ease both; }
