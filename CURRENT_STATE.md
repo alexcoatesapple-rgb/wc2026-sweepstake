@@ -4,7 +4,7 @@
 > `session-closeout` skill). One source of truth for "what's shipped and what's in
 > flight" — keep it short.
 
-**Version:** 1.0.0 (`package.json`)
+**Version:** 1.1.0 (`package.json`)
 **Host:** Netlify — push to `main` auto-deploys to production.
 
 ## What works today
@@ -16,25 +16,26 @@
   all sweeps remembered on the device.
 - Scoring/leaderboard (`buildStats`), live provisional scoring, matchday report
   card, shareable canvas image. Admin overview, rename, expand-all leaderboard.
+- Knockout **Bracket** tab (v1.1.0): auto-filling Round of 32. Winners &
+  runners-up lock from the live `/standings` feed as each group ends; the 8
+  third-place slots fill from `R32_THIRD_COMBO` (FIFA Annexe C, set once the
+  qualifying thirds are known) and/or self-heal from ESPN R32 fixtures (ESPN
+  authoritative). `R32_BRACKET` + `resolveBracket` are pure/derived — no Supabase,
+  no new persisted state. Pre-kickoff fixtures show no score.
 
-## In flight / uncommitted
+## Recently shipped
 
-- **Auto group winners + exits (#3)** — new `netlify/functions/standings.js` proxies
-  ESPN group standings; `deriveFromStandings` + `mergeDerived` (App.jsx) turn that
-  into group winners (rank 1) and group-stage exits (ESPN `advanced` flag), only for
-  *completed* groups. `autoSyncStandings()` broadcasts them to every remembered
-  sweep on load. Manual toggles remain as override (merge is additive). Also added
-  the `"Bosnia-Herzegovina"` alias to `API_TEAM_MAP`. Logic verified against live
-  ESPN; browser E2E of the function still pending (needs `netlify dev` / deploy
-  preview). Uncommitted as of 2026-06-26.
-- **Scoring regression test (#4)** — `scripts/check-scoring.mjs` (run via `npm
-  test`) exercises the real `koWinner` / `teamMatchPts` / `buildStats` /
-  `deriveFromStandings` from `App.jsx`; 34 assertions, all passing.
-- **Pre-deploy audit** — `AUDIT_2026-06-26.md`. Found + fixed **B1** (3rd-placed
-  teams were prematurely + stickily eliminated): `deriveFromStandings` now only
-  auto-eliminates rank-4 per group, plus non-advanced teams once ALL groups are
-  complete. Also fixed the stale Teams-tab helper copy. Deferred: read
-  amplification on load (I1), CJS-in-ESM function warning (I2).
+- **v1.1.0 — Knockout bracket (Bracket tab)** — see "What works today". Came out of
+  a brainstorm on auto-filling the R32 as groups finish. Deliberately did **not**
+  transcribe all 495 Annexe C rows: one realised `R32_THIRD_COMBO` row + ESPN
+  override. Verified build / `npm test` (34) / fix sim / live preview. 2026-06-27.
+- **Auto group winners + exits (#3)** — `standings.js` + `deriveFromStandings` /
+  `mergeDerived` / `autoSyncStandings`; group winners (rank 1) + group-stage exits
+  (ESPN `advanced`) for completed groups, broadcast to remembered sweeps.
+- **Scoring regression test (#4)** — `scripts/check-scoring.mjs` (`npm test`), 34
+  assertions.
+- **Pre-deploy audit** — `AUDIT_2026-06-26.md`: fixed B1 (premature sticky 3rd-place
+  elimination). Deferred: read amplification on load (I1), CJS-in-ESM warning (I2).
 
 ## Known gotchas
 
