@@ -74,6 +74,10 @@ redsB, pensWinner, at, live? }`. `stage` is a `STAGE` id (`GROUP`, `R32`, `R16`,
 - **`fixtures.js` ↔ the ingest in `App.jsx`.** The Netlify function shapes the
   ESPN payload (`statusState`, `round` from notes, red-card counts);
   `autoSyncFromESPN` consumes that exact shape. Change one side, change the other.
+- **ESPN scores are `"0"`/null *before* kickoff.** `fixtures.js` sets `homeScore:
+  home.score ?? null`, and `Number("0")` / `Number(null)` are both `0` (finite) —
+  so any view that displays a score must gate on `statusState` being `in`/`post`,
+  or a *scheduled* fixture renders a phantom `0–0`. (Bit the R32 bracket overlay.)
 - **`standings.js` ↔ `deriveFromStandings` in `App.jsx`.** The standings function
   returns `{ groups: [{ name, complete, teams: [{ name, rank, advanced }] }] }`;
   `deriveFromStandings` consumes that exact shape to set group winners (rank 1) and
