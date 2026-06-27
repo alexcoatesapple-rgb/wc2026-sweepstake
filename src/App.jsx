@@ -230,6 +230,65 @@ function deriveFromStandings(groups) {
   return { winners, eliminated, unmapped };
 }
 
+// ── Round of 32 bracket (FIFA's pre-published structure) ──────────────────────
+// Each tie is defined by the group POSITIONS that feed it, fixed in advance — so
+// winners/runners-up auto-fill the moment a group ends. Slot shapes:
+//   {w:"E"} group winner · {r:"C"} runner-up · {third:[...candidates]} best-third.
+// Third slots only resolve once all 12 groups finish and the realised combination
+// is known (FIFA Annexe C, 495 possible). ESPN R32 fixtures are the source of
+// truth and OVERRIDE this once published — so any error here self-heals.
+const R32_BRACKET = [
+  { m: 73, a: { r: "A" }, b: { r: "B" } },
+  { m: 74, a: { w: "E" }, b: { third: ["A","B","C","D","F"] } },
+  { m: 75, a: { w: "F" }, b: { r: "C" } },
+  { m: 76, a: { w: "C" }, b: { r: "F" } },
+  { m: 77, a: { w: "I" }, b: { third: ["C","D","F","G","H"] } },
+  { m: 78, a: { r: "E" }, b: { r: "I" } },
+  { m: 79, a: { w: "A" }, b: { third: ["C","E","F","H","I"] } },
+  { m: 80, a: { w: "L" }, b: { third: ["E","H","I","J","K"] } },
+  { m: 81, a: { w: "D" }, b: { third: ["B","E","F","I","J"] } },
+  { m: 82, a: { w: "G" }, b: { third: ["A","E","H","I","J"] } },
+  { m: 83, a: { r: "K" }, b: { r: "L" } },
+  { m: 84, a: { w: "H" }, b: { r: "J" } },
+  { m: 85, a: { w: "B" }, b: { third: ["E","F","G","I","J"] } },
+  { m: 86, a: { w: "J" }, b: { r: "H" } },
+  { m: 87, a: { w: "K" }, b: { third: ["D","E","I","J","L"] } },
+  { m: 88, a: { r: "D" }, b: { r: "G" } },
+];
+
+// Map position keys ("A1"/"A2"/"A3") to team ids from the live /standings payload.
+// COMPLETE groups only — a winner/runner-up/third is never guessed mid-group.
+function standingsPositions(groups) {
+  const pos = {};
+  for (const g of groups || []) {
+    if (!g.complete) continue;
+    const letter = ((String(g.name).match(/([A-L])\s*$/i) || [])[1] || "").toUpperCase();
+    if (!letter) continue;
+    for (const t of g.teams || []) {
+      const id = apiTeamId(t.name);
+      if (!id) continue;
+      if (t.rank === 1) pos[letter + "1"] = id;
+      else if (t.rank === 2) pos[letter + "2"] = id;
+      else if (t.rank === 3) pos[letter + "3"] = id;
+    }
+  }
+  return pos;
+}
+
+// Resolve the 16 R32 ties from live standings + the realised third-place
+// combination (`thirdCombo`: { matchNumber: groupLetter }). Unknown sides come
+// back as { teamId: null, label } so the UI can show a placeholder.
+function resolveBracket(groups, thirdCombo) {
+  const pos = standingsPositions(groups);
+  const side = (m, s) => {
+    if (s.w) return { kind: "w", teamId: pos[s.w + "1"] || null, label: `Winner ${s.w}` };
+    if (s.r) return { kind: "r", teamId: pos[s.r + "2"] || null, label: `Runner-up ${s.r}` };
+    const fromGroup = thirdCombo?.[m];
+    return { kind: "third", teamId: fromGroup ? (pos[fromGroup + "3"] || null) : null, label: `3rd ${s.third.join("/")}` };
+  };
+  return R32_BRACKET.map(t => ({ m: t.m, a: side(t.m, t.a), b: side(t.m, t.b) }));
+}
+
 // Union derived facts into a sweep's stored maps. Additive ONLY — never clears a
 // flag, so a manual override is preserved. Returns the next maps + a changed flag.
 function mergeDerived(st, winners, eliminated) {
@@ -1526,6 +1585,138 @@ function DrawReveal({ state, onDone }) {
   );
 }
 
+/* ---- Knockout bracket (Round of 32) ---- */
+// Tonight's realised best-third combination (FIFA Annexe C) — keyed by R32 match
+// number → the group whose 3rd-placed team fills that slot. null until all 12
+// groups finish and the 8 qualifying thirds are known; fill it then (one row,
+// ~8 entries) and the third slots resolve. ESPN R32 fixtures override regardless.
+const R32_THIRD_COMBO = null; // e.g. { 74:"B", 77:"D", 79:"C", 80:"E", 81:"F", 82:"H", 85:"G", 87:"I" }
+
+function BracketView({ state, stats, espnMatches = [] }) {
+  const [groups, setGroups] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      try {
+        const res = await fetch('/.netlify/functions/standings');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.error) return;
+        if (alive) setGroups(data.groups || []);
+      } catch (_) {} finally { if (alive) setLoaded(true); }
+    }
+    load();
+    const id = setInterval(load, 60_000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  const ties = useMemo(() => resolveBracket(groups, R32_THIRD_COMBO), [groups]);
+
+  // ESPN R32 fixtures/results are the source of truth. `byTeam` maps each team to
+  // its real R32 opponent — used to fill (and override) third-place slots, which
+  // is what makes the projection self-heal. `actual` carries status + scores for
+  // the result overlay; scores are kept only once a match has actually started
+  // (ESPN reports "0"/null pre-kickoff, which must not render as a 0–0 result).
+  const { actual, byTeam } = useMemo(() => {
+    const actual = new Map(), byTeam = new Map();
+    const add = (a, b, sa, sb, done, started) => {
+      actual.set([a, b].sort().join('|'), { scores: started ? { [a]: sa, [b]: sb } : null, done });
+      byTeam.set(a, b); byTeam.set(b, a);
+    };
+    for (const m of espnMatches) {
+      if (apiRoundToStage(m.round) !== 'R32') continue;
+      const a = apiTeamId(m.homeTeam), b = apiTeamId(m.awayTeam);
+      if (!a || !b) continue;
+      add(a, b, Number(m.homeScore), Number(m.awayScore), m.statusState === 'post', m.statusState === 'in' || m.statusState === 'post');
+    }
+    for (const r of state.results || []) {
+      if (r.stage !== 'R32' || !r.teamA || !r.teamB) continue;
+      add(r.teamA, r.teamB, r.scoreA, r.scoreB, !r.live, true);
+    }
+    return { actual, byTeam };
+  }, [espnMatches, state.results]);
+
+  // Apply the ESPN override: a third-place slot takes the real opponent of its
+  // (deterministic) winner partner from the live fixture, beating the projected
+  // combo — so a missing or mis-transcribed R32_THIRD_COMBO corrects itself.
+  const view = useMemo(() => {
+    const override = (s, partner) => {
+      if (s.kind !== "third") return s;
+      const espnOpp = partner.teamId ? byTeam.get(partner.teamId) : null;
+      return espnOpp ? { ...s, teamId: espnOpp } : s;
+    };
+    return ties.map(t => ({ m: t.m, a: override(t.a, t.b), b: override(t.b, t.a) }));
+  }, [ties, byTeam]);
+
+  const owned = stats.ownedTeams;
+  const elim = stats.eliminated;
+  const hasActual = actual.size > 0;
+  const allActual = actual.size >= 16;
+  const resolved = view.filter(t => t.a.teamId && t.b.teamId).length;
+  const ownedIn = view.reduce((n, t) => n + (owned.has(t.a.teamId) ? 1 : 0) + (owned.has(t.b.teamId) ? 1 : 0), 0);
+
+  function renderSide(s, act, winner) {
+    if (!s.teamId) return <div className="bkt-team bkt-ph">{s.label}</div>;
+    const t = TEAM[s.teamId];
+    const sc = act?.scores?.[s.teamId];
+    return (
+      <div className={cls("bkt-team", owned.has(s.teamId) && "bkt-own", elim.has(s.teamId) && "bkt-dead", winner === s.teamId && "bkt-win")}>
+        <span className="bkt-flag">{t.flag}</span>
+        <span className="bkt-name">{t.name}</span>
+        {owned.has(s.teamId) && <span className="bkt-dot" title="Your team">●</span>}
+        {Number.isFinite(sc) && <span className="bkt-score">{sc}</span>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="bracket-wrap">
+      <div className="board-eyebrow">
+        <span className="board-eyebrow-label">Round of 32 · {hasActual ? "Confirmed" : "Projected"}</span>
+        <div className="board-eyebrow-line" />
+        <span className="board-eyebrow-right">{resolved}/16 set · {ownedIn} of yours</span>
+      </div>
+
+      <div className="bkt-note">
+        {hasActual
+          ? "Fixtures confirmed from ESPN. ● marks your teams."
+          : "Auto-filled from group results — winners & runners-up lock as each group ends. The 8 third-place slots resolve once all 12 groups finish. ● marks your teams."}
+      </div>
+
+      {!loaded ? (
+        <div className="notice">Loading the bracket…</div>
+      ) : (
+        <div className="bkt-grid">
+          {view.map(t => {
+            const aId = t.a.teamId, bId = t.b.teamId;
+            const pairKey = aId && bId ? [aId, bId].sort().join('|') : null;
+            const act = pairKey ? actual.get(pairKey) : null;
+            let winner = null;
+            if (act?.done && act.scores) {
+              const sa = act.scores[aId], sb = act.scores[bId];
+              if (sa > sb) winner = aId; else if (sb > sa) winner = bId;
+            }
+            const tag = !pairKey ? null : act ? "ok" : allActual ? "warn" : "pred";
+            return (
+              <div key={t.m} className={cls("bkt-tie", (owned.has(aId) || owned.has(bId)) && "bkt-tie-own")}>
+                <div className="bkt-num">
+                  <span>Match {t.m}</span>
+                  {tag === "ok"   && <span className="bkt-tag bkt-tag-ok">ESPN ✓</span>}
+                  {tag === "warn" && <span className="bkt-tag bkt-tag-warn">ESPN differs</span>}
+                  {tag === "pred" && <span className="bkt-tag bkt-tag-pred">Projected</span>}
+                </div>
+                {renderSide(t.a, act, winner)}
+                {renderSide(t.b, act, winner)}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ---- Main shell ---- */
 function Main({
   state, sweepId, known, commit, refresh, saveStatus, tab, setTab,
@@ -1580,7 +1771,7 @@ function Main({
     () => buildStats({ ...state, results: [...(state.results || []), ...provisionalLive] }),
     [state, provisionalLive]
   );
-  const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["howto","How it works"],["setup","Setup"]];
+  const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["bracket","Bracket"],["howto","How it works"],["setup","Setup"]];
   const others = known.filter(k => k.id !== sweepId);
   return (
     <div className="main">
@@ -1626,6 +1817,7 @@ function Main({
       {tab === "table"   && <TableView   state={state} stats={stats} onMatchdayReport={onMatchdayReport} hasLive={provisionalLive.length > 0} />}
       {tab === "teams"   && <TeamsView   state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} />}
       {tab === "matches" && <MatchesView state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} addResultsToAll={addResultsToAll} espnMatches={espnMatches} />}
+      {tab === "bracket" && <BracketView state={state} stats={stats} espnMatches={espnMatches} />}
       {tab === "howto"   && <HowItWorks  state={state} stats={stats} />}
       {tab === "setup"   && (
         <SetupView
@@ -2929,6 +3121,30 @@ function Styles() {
       .chip-star     { color: var(--accent); font-size: 10px; line-height: 1; }
       .chip-pts      { font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
       .chip-pts-plain { font-weight: 700; color: var(--tnum); font-variant-numeric: tabular-nums; }
+
+      /* Knockout bracket */
+      .bracket-wrap   { padding: 4px 0 24px; }
+      .bkt-note       { font-size: 12px; color: var(--muted); margin: 10px 0 16px; line-height: 1.5; }
+      .bkt-grid       { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+      .bkt-tie        { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+      .bkt-tie-own    { border-color: var(--accent-line); box-shadow: inset 0 0 0 1px var(--accent-line); }
+      .bkt-num        { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); font-weight: 700; margin-bottom: 4px; }
+      .bkt-tag        { font-size: 8.5px; letter-spacing: .06em; padding: 1px 5px; border-radius: 3px; font-weight: 700; white-space: nowrap; }
+      .bkt-tag-pred   { color: var(--muted); background: var(--track); }
+      .bkt-tag-ok     { color: var(--win); background: #e7f3ec; }
+      .bkt-tag-warn   { color: var(--on-accent); background: var(--signal); }
+      .bkt-team       { display: flex; align-items: center; gap: 7px; padding: 5px 2px; font-size: 13.5px; font-weight: 600; }
+      .bkt-team + .bkt-team { border-top: 1px solid var(--line); }
+      .bkt-flag       { font-size: 15px; line-height: 1; }
+      .bkt-name       { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .bkt-dot        { color: var(--accent); font-size: 9px; line-height: 1; }
+      .bkt-score      { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--tnum); min-width: 14px; text-align: right; }
+      .bkt-ph         { color: var(--muted); font-style: italic; font-weight: 500; font-size: 12px; }
+      .bkt-own        { color: var(--accent); }
+      .bkt-win .bkt-name { color: var(--win); }
+      .bkt-dead       { opacity: .42; }
+      .bkt-dead .bkt-name { text-decoration: line-through; text-decoration-color: var(--muted); }
+      @media (max-width: 560px) { .bkt-grid { grid-template-columns: 1fr; } }
 
       /* Commentary & results */
       .board-commentary    { margin-top: 18px; display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; background: var(--card); border: 1px solid var(--line); border-radius: 4px; animation: rise .4s .3s ease both; }
