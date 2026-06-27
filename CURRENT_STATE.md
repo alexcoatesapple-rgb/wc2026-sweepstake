@@ -4,7 +4,7 @@
 > `session-closeout` skill). One source of truth for "what's shipped and what's in
 > flight" — keep it short.
 
-**Version:** 1.1.0 (`package.json`)
+**Version:** 1.2.0 (`package.json`)
 **Host:** Netlify — push to `main` auto-deploys to production.
 
 ## What works today
@@ -16,15 +16,23 @@
   all sweeps remembered on the device.
 - Scoring/leaderboard (`buildStats`), live provisional scoring, matchday report
   card, shareable canvas image. Admin overview, rename, expand-all leaderboard.
-- Knockout **Bracket** tab (v1.1.0): auto-filling Round of 32. Winners &
-  runners-up lock from the live `/standings` feed as each group ends; the 8
-  third-place slots fill from `R32_THIRD_COMBO` (FIFA Annexe C, set once the
-  qualifying thirds are known) and/or self-heal from ESPN R32 fixtures (ESPN
-  authoritative). `R32_BRACKET` + `resolveBracket` are pure/derived — no Supabase,
-  no new persisted state. Pre-kickoff fixtures show no score.
+- Knockout **Bracket** tab (v1.2.0): full two-sided knockout tree (R32→Final + 3rd
+  place). R32 seeded from the live `/standings` feed; the 8 third slots from
+  `R32_THIRD_COMBO` (FIFA Annexe C) / ESPN R32 override. Every later slot
+  propagates from match winners (`resolveBracketTree` + `KO_FLOW`, losing
+  semi-finalists → 3rd place), only from FINISHED matches. Empty slots read
+  "Winner Mxx". Pure/derived — no Supabase, no new persisted state. Layout is a
+  `space-around` flex tree, horizontally scrollable on mobile.
 
 ## Recently shipped
 
+- **v1.2.0 — Full knockout tree** — expanded the R32-only bracket to the whole
+  two-sided tree (R16/QF/SF/Final/3rd). `KO_FLOW` + `resolveBracketTree` propagate
+  winners (and SF losers → 3rd place) from results; only finished matches advance.
+  Resolver validated in a scratchpad sim (propagation, pens, live-no-advance);
+  build / `npm test` (34) / live preview desktop+mobile. Known: a pens game ESPN
+  can't resolve stalls that branch until the organiser enters the pens winner.
+  2026-06-27.
 - **v1.1.0 — Knockout bracket (Bracket tab)** — see "What works today". Came out of
   a brainstorm on auto-filling the R32 as groups finish. Deliberately did **not**
   transcribe all 495 Annexe C rows: one realised `R32_THIRD_COMBO` row + ESPN
