@@ -1049,7 +1049,7 @@ export default function App() {
       },
     };
     const ok = await saveSweep(sweepId, next);
-    setState(next);
+    if (ok) setState(next);   // don't show a prediction as saved if the write failed
     setSave(ok ? "saved" : "error");
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => setSave("idle"), 2500);
@@ -2018,6 +2018,11 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
     const ok = await savePrediction(me, picks);
     if (ok) setDirty(false);
   }
+  // Click a leaderboard name → load that player's bracket into the view above.
+  function viewPlayer(id) {
+    chooseMe(id);
+    viewportRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
 
   // Leaderboard: everyone who has entered, scored against the actual tree (live).
   const board = useMemo(() => {
@@ -2137,14 +2142,6 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
                 ))}
               </select>
             </label>
-            {me && !locked && (
-              <div className="pred-actions">
-                <span className="pred-progress">{picked}/32 picked</span>
-                <button type="button" className="pred-save" onClick={onSave} disabled={!dirty}>
-                  {dirty ? "Save my bracket" : "Saved"}
-                </button>
-              </div>
-            )}
           </div>
 
           {!me ? (
@@ -2179,6 +2176,14 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
                   </div>
                 </div>
               </div>
+              {!locked && (
+                <div className="pred-savebar">
+                  <span className="pred-progress">{picked}/32 picked</span>
+                  <button type="button" className="pred-save" onClick={onSave} disabled={!dirty}>
+                    {dirty || !state.predictions?.[me]?.picks ? "Save my bracket" : "Saved ✓"}
+                  </button>
+                </div>
+              )}
             </>
           )}
 
@@ -2203,7 +2208,8 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
                   {board.map(r => {
                     const champ = champOf(r);
                     return (
-                      <tr key={r.p.id} className={cls(r.p.id === me && "pred-me")}>
+                      <tr key={r.p.id} className={cls("pred-row", r.p.id === me && "pred-me")}
+                        onClick={() => viewPlayer(r.p.id)} title={`View ${r.p.name}'s bracket`}>
                         <td>{r.rank}</td>
                         <td>{r.p.name}</td>
                         {locked && <td className="pred-champ">{champ ? <>{champ.flag} {champ.name}</> : <span className="bkt-ph">—</span>}</td>}
@@ -3686,6 +3692,7 @@ function Styles() {
       .pred-who       { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--muted); }
       .pred-who select { font: inherit; font-weight: 600; color: var(--ink); padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); }
       .pred-actions   { display: flex; align-items: center; gap: 10px; }
+      .pred-savebar   { position: sticky; bottom: 0; z-index: 5; display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 10px; padding: 10px 12px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 -2px 10px rgba(0,0,0,.06); }
       .pred-progress  { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--muted); font-variant-numeric: tabular-nums; }
       .pred-save      { padding: 7px 14px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; font: 700 12px/1 'Space Grotesk',sans-serif; cursor: pointer; }
       .pred-save:disabled { background: var(--card); color: var(--muted); border-color: var(--line); cursor: default; }
@@ -3697,6 +3704,9 @@ function Styles() {
       .pred-table .num { text-align: right; font-variant-numeric: tabular-nums; }
       .pred-table .pred-champ { color: var(--muted); font-weight: 600; }
       .pred-table tr.pred-me td { background: var(--accent-line); }
+      .pred-table tr.pred-row { cursor: pointer; }
+      .pred-table tr.pred-row:hover td { background: var(--bg); }
+      .pred-table tr.pred-row.pred-me:hover td { background: var(--accent-line); }
 
       /* Commentary & results */
       .board-commentary    { margin-top: 18px; display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; background: var(--card); border: 1px solid var(--line); border-radius: 4px; animation: rise .4s .3s ease both; }
