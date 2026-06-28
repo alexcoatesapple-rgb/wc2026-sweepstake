@@ -4,7 +4,7 @@
 > `session-closeout` skill). One source of truth for "what's shipped and what's in
 > flight" — keep it short.
 
-**Version:** 1.2.0 (`package.json`)
+**Version:** 1.3.0 (`package.json`)
 **Host:** Netlify — push to `main` auto-deploys to production.
 
 ## What works today
@@ -26,6 +26,21 @@
 
 ## Recently shipped
 
+- **v1.3.0 — Predictions tab + bracket zoom** — players fill in the blank knockout
+  bracket (winner of every R32→Final tie), saved against their existing player name
+  (`state.predictions[playerId].picks`, honour system — no auth). Opens once the R32
+  is seeded (groups complete), auto-locks at first R32 kick-off. Weighted
+  round-advancement scoring (`PREDICTION_WEIGHTS`: R32 1 / R16 2 / QF 3 / SF 5 / 3rd
+  1 / Final 8) → live "percentage right" leaderboard; others' picks hidden until
+  lock. `resolvePredictionTree` = pure sibling of `resolveBracketTree` (propagates
+  *picks* not results); `scorePrediction` diffs predicted vs actual winners.
+  Concurrency-safe `savePrediction` (re-reads the row fresh, merges only its own
+  `predictions[me]` key — never spreads stale in-memory state, so it can't clobber
+  another predictor or an auto-synced result). New `scripts/check-predictions.mjs`
+  (5 assertions) wired into `npm test`. Bundled the bracket **zoom-to-fit** controls
+  (−/Fit/＋, auto-scale, scroll/pan) that the Predictions UI reuses. Verified: build
+  / `npm test` (39) / app boots clean (no console errors). NOT yet deployed. The
+  interactive tab needs a loaded sweep (real PIN) to exercise. 2026-06-28.
 - **v1.2.0 — Full knockout tree** — expanded the R32-only bracket to the whole
   two-sided tree (R16/QF/SF/Final/3rd). `KO_FLOW` + `resolveBracketTree` propagate
   winners (and SF losers → 3rd place) from results; only finished matches advance.
