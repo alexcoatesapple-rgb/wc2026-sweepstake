@@ -398,9 +398,13 @@ function resolvePredictionTree(actualTree, picks) {
     } else {
       const def = KO_BY_NUM.get(m);
       stage = def.stage;
+      // Feeder side = this predictor's own pick for the feeding tie. But if they
+      // never picked it AND that tie is already decided (a late entrant who missed
+      // an earlier knockout game), fall back to who ACTUALLY advanced — otherwise a
+      // single missed early game would kill the whole branch above it.
       const feeder = (f) => f.w != null
-        ? { teamId: winnerOf[f.w] ?? null, label: `Winner M${f.w}` }
-        : { teamId: loserOf[f.l] ?? null, label: `Loser M${f.l}` };
+        ? { teamId: winnerOf[f.w] ?? actualTree.get(f.w)?.winner ?? null, label: `Winner M${f.w}` }
+        : { teamId: loserOf[f.l] ?? actualTree.get(f.l)?.loser ?? null, label: `Loser M${f.l}` };
       a = feeder(def.a); b = feeder(def.b);
     }
     const pick = pk[m] || null;
@@ -1045,7 +1049,13 @@ export default function App() {
       ...base,
       predictions: {
         ...(base.predictions || {}),
-        [playerId]: { picks, savedAt: new Date().toISOString() },
+        // Merge, don't replace: a pick saved by another device (or an earlier save)
+        // is never dropped. Working picks win on conflicts. Safe because picks only
+        // ever GROW — write-once means a saved tie is frozen, never removed.
+        [playerId]: {
+          picks: { ...(base.predictions?.[playerId]?.picks || {}), ...picks },
+          savedAt: new Date().toISOString(),
+        },
       },
     };
     const ok = await saveSweep(sweepId, next);
@@ -1969,58 +1979,86 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
   );
 
   // The R32 is "set" once every tie has both real teams (groups done + thirds known).
-  // Predictions lock the moment the first R32 match kicks off — no organiser action.
+  // Entry opens then and stays open — there is no global lock. Each tie freezes on
+  // its own: once the player has SAVED a pick for it, or once that tie's real match
+  // has kicked off (see `frozen` in renderSide). No organiser action needed.
   const r32Seeded = useMemo(
     () => [73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88]
       .every(m => actualTree.get(m)?.a.teamId && actualTree.get(m)?.b.teamId),
-    [actualTree]
-  );
-  const locked = useMemo(
-    () => [...actualTree.values()].some(t => t.stage === 'R32' && t.result?.started),
     [actualTree]
   );
   const actualDecided = useMemo(
     () => [...actualTree.values()].filter(t => t.winner).length,
     [actualTree]
   );
+  // Predicted champions are only revealed once every R32 game has kicked off — i.e.
+  // once nobody can still be entering R32 picks — so the leaderboard can't leak a
+  // strategy to someone who hasn't locked their own bracket yet.
+  const allR32Started = useMemo(
+    () => [73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88]
+      .every(m => actualTree.get(m)?.result?.started),
+    [actualTree]
+  );
 
-  // Identity: pick yourself from the existing players (honour system, like the rest
-  // of the app). Remembered per-device so you don't re-pick each visit.
+  // Identity: claim yourself from the existing players (honour system, like the rest
+  // of the app), remembered per-device. `viewing` lets you PEEK at someone else's
+  // bracket read-only (from the leaderboard) WITHOUT changing who you are — so you can
+  // never accidentally edit or save over another player's predictions.
   const idKey = 'wc26_predictor_' + sweepId;
-  const [me, setMe] = useState(() => {
+  const [myId, setMyId] = useState(() => {
     try { return localStorage.getItem(idKey) || ''; } catch { return ''; }
   });
-  const chooseMe = (id) => {
-    setMe(id);
-    try { id ? localStorage.setItem(idKey, id) : localStorage.removeItem(idKey); } catch {}
-  };
+  const [viewing, setViewing] = useState('');   // a player being peeked at; '' = your own bracket
+  const me = viewing || myId;                    // whose bracket is on screen
+  const isMine = !viewing;                        // editable only when it's your own
 
-  // Editable picks for `me`. Reloaded only when the selected player changes — never
+  // Editable picks for `me`. Reloaded only when the displayed player changes — never
   // on state.predictions, so an in-flight edit is never clobbered by a save/refresh.
   const [picks, setPicks] = useState({});
   const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const editSeq = useRef(0);                      // bumped on every pick, to detect edits mid-save
   useEffect(() => {
     setPicks({ ...(state.predictions?.[me]?.picks || {}) });
     setDirty(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me, sweepId]);
 
+  // Ties this player has already SAVED. Write-once: a saved pick can't be changed,
+  // but blank ties stay open until you save (or until that game kicks off).
+  const committedPicks = state.predictions?.[me]?.picks || {};
+
   const predTree = useMemo(() => resolvePredictionTree(actualTree, picks), [actualTree, picks]);
   const picked = useMemo(() => [...predTree.values()].filter(t => t.winner).length, [predTree]);
 
   function pick(m, teamId) {
-    if (locked || !teamId) return;
+    if (!isMine || !teamId) return;                   // can't edit someone else's bracket
+    if (actualTree.get(m)?.result?.started) return;  // that game has already kicked off
+    if (committedPicks[m] != null) return;            // already saved this tie — write-once
     setPicks(p => ({ ...p, [m]: teamId }));
+    editSeq.current += 1;
     setDirty(true);
   }
   async function onSave() {
-    if (!me) return;
+    if (!me || !isMine || saving) return;
+    if (!window.confirm("Save your picks? Saved picks lock in — you can't change them afterwards. You can still come back to fill in games that haven't kicked off yet.")) return;
+    const seq = editSeq.current;
+    setSaving(true);
     const ok = await savePrediction(me, picks);
-    if (ok) setDirty(false);
+    setSaving(false);
+    if (ok && editSeq.current === seq) setDirty(false);  // don't claim "saved" if edited mid-save
   }
-  // Click a leaderboard name → load that player's bracket into the view above.
+  // The dropdown: declare who YOU are — your bracket becomes editable.
+  function claimMe(id) {
+    if (dirty && !window.confirm("You have unsaved picks that will be lost. Switch anyway?")) return;
+    setMyId(id);
+    setViewing('');
+    try { id ? localStorage.setItem(idKey, id) : localStorage.removeItem(idKey); } catch {}
+  }
+  // Click a leaderboard name → PEEK at that player's bracket, read-only.
   function viewPlayer(id) {
-    chooseMe(id);
+    if (dirty && id !== myId && !window.confirm("You have unsaved picks that will be lost. View anyway?")) return;
+    setViewing(id === myId ? '' : id);
     viewportRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -2066,10 +2104,12 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
     const team = TEAM[side.teamId];
     const isPick = t?.winner === side.teamId;
     const decided = !!actualWinner;
-    const correct = locked && decided && isPick && actualWinner === side.teamId;
-    const wrong   = locked && decided && isPick && actualWinner !== side.teamId;
-    const actualHit = locked && decided && actualWinner === side.teamId && !isPick;
-    const pickable = !locked && side.teamId && predTree.get(m)?.a.teamId && predTree.get(m)?.b.teamId;
+    const started = !!actualTree.get(m)?.result?.started;
+    const frozen = started || committedPicks[m] != null;  // game kicked off, or pick already saved
+    const correct = decided && isPick && actualWinner === side.teamId;
+    const wrong   = decided && isPick && actualWinner !== side.teamId;
+    const actualHit = decided && actualWinner === side.teamId && !isPick;
+    const pickable = isMine && !frozen && t?.a.teamId && t?.b.teamId;
     return (
       <button
         type="button"
@@ -2093,9 +2133,10 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
     const t = predTree.get(num);
     if (!t) return null;
     const label = t.stage === "FINAL" ? "Final" : t.stage === "THIRD" ? "3rd place" : `M${num}`;
+    const lockedIn = committedPicks[num] != null && !actualTree.get(num)?.winner;  // saved, not yet played
     return (
       <div key={num} className={cls("bkt-tie", `bkt-${sideClass}`, t.stage === "FINAL" && "bkt-final")}>
-        <div className="bkt-num"><span>{label}</span></div>
+        <div className="bkt-num"><span>{label}</span>{lockedIn && <span className="bkt-lock" title="Saved — locked in">🔒</span>}</div>
         {renderSide(t.a, num)}
         {renderSide(t.b, num)}
       </div>
@@ -2116,7 +2157,7 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
         <span className="board-eyebrow-label">Predictions</span>
         <div className="board-eyebrow-line" />
         <span className="board-eyebrow-right">
-          {locked ? `Locked · ${actualDecided}/32 played` : r32Seeded ? "Open · locks at R32 kick-off" : "Opens when groups end"}
+          {r32Seeded ? `Open · ${actualDecided}/32 played` : "Opens when groups end"}
         </span>
       </div>
 
@@ -2125,15 +2166,16 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
       ) : !r32Seeded ? (
         <div className="bkt-note">
           Predictions open once the group stage finishes and the Round of 32 is set —
-          then you fill in every knockout winner, and your bracket locks the moment the
-          first R32 match kicks off. Scores update live as results land.
+          then you fill in every knockout winner. You can enter any time, but each pick
+          locks the moment you save it (and you can't pick a game that has already kicked
+          off). Scores update live as results land.
         </div>
       ) : (
         <>
           <div className="pred-bar">
             <label className="pred-who">
-              <span>{locked ? "View bracket:" : "You are:"}</span>
-              <select value={me} onChange={e => chooseMe(e.target.value)}>
+              <span>You are:</span>
+              <select value={myId} onChange={e => claimMe(e.target.value)}>
                 <option value="">— pick your name —</option>
                 {state.parts.map(p => (
                   <option key={p.id} value={p.id}>
@@ -2145,14 +2187,25 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
           </div>
 
           {!me ? (
-            <div className="bkt-note">Pick your name above to {locked ? "view a bracket" : "fill in your predictions"}.</div>
+            <div className="bkt-note">Pick your name above to fill in your predictions.</div>
           ) : (
             <>
-              <div className="bkt-note">
-                {locked
-                  ? "Locked in. ✓ correct pick · ✗ missed · faded = the team that actually advanced. ● marks your sweep teams."
-                  : "Tap the team you think wins each tie — your pick flows into the next round. Later ties unlock once you've chosen both feeders. ● marks your sweep teams."}
-              </div>
+              {isMine ? (
+                <div className="bkt-note">
+                  Tap who you think wins each tie, then Save — saved picks lock in (🔒) and
+                  can't be changed. Fill the rest whenever you like; you just can't pick a
+                  game that has already kicked off. ✓ correct · ✗ missed · faded = who
+                  actually advanced. ● marks your sweep teams.
+                </div>
+              ) : (
+                <div className="bkt-note">
+                  Viewing <strong>{state.parts.find(p => p.id === me)?.name || 'this player'}</strong>'s
+                  bracket — read-only.{" "}
+                  <button type="button" className="pred-linkbtn" onClick={() => viewPlayer(myId)}>
+                    Back to your bracket
+                  </button>
+                </div>
+              )}
               <div className="bkt-zoom">
                 <button type="button" aria-label="Zoom out" onClick={() => setZoom(Math.max(0.2, +(z / 1.2).toFixed(3)))}>−</button>
                 <button type="button" className="bkt-zoom-fit" onClick={() => setZoom(null)}>{zoom == null ? "Fit" : `${Math.round(z * 100)}%`}</button>
@@ -2176,11 +2229,11 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
                   </div>
                 </div>
               </div>
-              {!locked && (
+              {isMine && (
                 <div className="pred-savebar">
                   <span className="pred-progress">{picked}/32 picked</span>
-                  <button type="button" className="pred-save" onClick={onSave} disabled={!dirty}>
-                    {dirty || !state.predictions?.[me]?.picks ? "Save my bracket" : "Saved ✓"}
+                  <button type="button" className="pred-save" onClick={onSave} disabled={!dirty || saving}>
+                    {saving ? "Saving…" : dirty ? "Save & lock picks" : state.predictions?.[me]?.picks ? "Saved ✓" : "Save & lock picks"}
                   </button>
                 </div>
               )}
@@ -2195,14 +2248,14 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
             </div>
             {board.length === 0 ? (
               <div className="bkt-note">No predictions entered yet.</div>
-            ) : !locked && actualDecided === 0 ? (
+            ) : actualDecided === 0 ? (
               <div className="pred-roster">
                 Entered: {board.map(r => r.p.name).join(" · ")} — scores appear once the knockouts begin.
               </div>
             ) : (
               <table className="pred-table">
                 <thead>
-                  <tr><th>#</th><th>Name</th>{locked && <th>Champion</th>}<th className="num">Correct</th><th className="num">Points</th><th className="num">%</th></tr>
+                  <tr><th>#</th><th>Name</th>{allR32Started && <th>Champion</th>}<th className="num">Correct</th><th className="num">Points</th><th className="num">%</th></tr>
                 </thead>
                 <tbody>
                   {board.map(r => {
@@ -2212,7 +2265,7 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
                         onClick={() => viewPlayer(r.p.id)} title={`View ${r.p.name}'s bracket`}>
                         <td>{r.rank}</td>
                         <td>{r.p.name}</td>
-                        {locked && <td className="pred-champ">{champ ? <>{champ.flag} {champ.name}</> : <span className="bkt-ph">—</span>}</td>}
+                        {allR32Started && <td className="pred-champ">{champ ? <>{champ.flag} {champ.name}</> : <span className="bkt-ph">—</span>}</td>}
                         <td className="num">{r.correct}/{r.decided}</td>
                         <td className="num">{r.points}</td>
                         <td className="num">{r.pct}%</td>
@@ -3687,6 +3740,8 @@ function Styles() {
       .bkt-mark-ok    { color: var(--win); }
       .bkt-mark-no    { color: var(--accent); }
       .bkt-pick-ph    { padding-left: 6px; }
+      .bkt-lock       { font-size: 9px; margin-left: 4px; opacity: .55; }
+      .pred-linkbtn   { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; }
 
       .pred-bar       { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 6px 0 4px; }
       .pred-who       { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--muted); }

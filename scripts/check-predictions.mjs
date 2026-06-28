@@ -84,5 +84,16 @@ eq("wrong R32 cascades to its R16 feed",
 eq("garbage pick is ignored, not credited",
   scorePrediction(actualTree, { ...realityPicks, 104: "NOT_A_TEAM" }).correct, 31);
 
+// Late entrant: joined after m73 had already kicked off, so they have NO pick for
+// m73 — but DID pick everything downstream, naming the team that actually advanced.
+// The feeder-fallback (winnerOf ?? actual) means the missed game costs only itself
+// (1 pt), instead of nuking the whole branch above it. Without the fallback, m73's
+// empty feeder would invalidate m90 and everything fed from it.
+const lateEntrant = { ...realityPicks };
+delete lateEntrant[73];
+eq("missed R32 game costs only itself (feeder falls back to reality)",
+  strip(scorePrediction(actualTree, lateEntrant)),
+  { points: 62, correct: 31, decided: 32, possible: 63, pct: 98 });
+
 console.log(`\nprediction check: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
