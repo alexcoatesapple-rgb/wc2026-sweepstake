@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, Component } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, Component } from "react";
 import { supabase } from "./supabase.js";
 
 /* ============================================================
@@ -374,6 +374,62 @@ function resolveBracketTree(groups, thirdCombo, byTeam, resultIndex) {
     out.set(m, { m, stage, a, b, winner, loser, result: res || null });
   }
   return out;
+}
+
+// ── Predictions ───────────────────────────────────────────────────────────────
+// A prediction is a full set of knockout winners — structurally the same shape the
+// real bracket produces, but the winner of each tie comes from the predictor's
+// `picks` ({ matchNumber: teamId }) instead of a result. This is the sibling of
+// `resolveBracketTree`: the R32 sides come from the ACTUAL seeded tree (so everyone
+// predicts the same real opponents), then each pick propagates up the same FIFA
+// tree. A pick only counts if it names one of the two teams actually in that tie —
+// flipping an earlier round silently invalidates now-impossible later picks.
+function resolvePredictionTree(actualTree, picks) {
+  const out = new Map();
+  const winnerOf = {}, loserOf = {};
+  const pk = picks || {};
+  for (let m = 73; m <= 104; m++) {
+    let stage, a, b;
+    if (m <= 88) {
+      const t = actualTree.get(m);
+      stage = "R32";
+      a = { teamId: t?.a.teamId || null, label: t?.a.label };
+      b = { teamId: t?.b.teamId || null, label: t?.b.label };
+    } else {
+      const def = KO_BY_NUM.get(m);
+      stage = def.stage;
+      const feeder = (f) => f.w != null
+        ? { teamId: winnerOf[f.w] ?? null, label: `Winner M${f.w}` }
+        : { teamId: loserOf[f.l] ?? null, label: `Loser M${f.l}` };
+      a = feeder(def.a); b = feeder(def.b);
+    }
+    const pick = pk[m] || null;
+    const winner = (pick && (pick === a.teamId || pick === b.teamId)) ? pick : null;
+    const loser = winner ? (winner === a.teamId ? b.teamId : a.teamId) : null;
+    winnerOf[m] = winner; loserOf[m] = loser;
+    out.set(m, { m, stage, a, b, winner, loser });
+  }
+  return out;
+}
+
+// Points per correctly-picked tie winner, weighted by how far through the bracket
+// it is (a correct final is worth more than a correct R32). Tunable later, but a
+// sane default needs no config.
+const PREDICTION_WEIGHTS = { R32: 1, R16: 2, QF: 3, SF: 5, THIRD: 1, FINAL: 8 };
+
+// Score one prediction against the actual tree. Only DECIDED ties count (the live
+// percentage climbs as results land). `pct` is weighted points earned / available.
+function scorePrediction(actualTree, picks) {
+  const predTree = resolvePredictionTree(actualTree, picks);
+  let points = 0, correct = 0, decided = 0, possible = 0;
+  for (let m = 73; m <= 104; m++) {
+    const actual = actualTree.get(m);
+    if (!actual || !actual.winner) continue;
+    const w = PREDICTION_WEIGHTS[actual.stage] || 1;
+    decided++; possible += w;
+    if (predTree.get(m)?.winner === actual.winner) { points += w; correct++; }
+  }
+  return { points, correct, decided, possible, pct: possible ? Math.round((points / possible) * 100) : 0, predTree };
 }
 
 // Union derived facts into a sweep's stored maps. Additive ONLY — never clears a
@@ -976,6 +1032,30 @@ export default function App() {
     saveTimer.current = setTimeout(() => setSave("idle"), 2500);
   }
 
+  // Save ONE predictor's bracket. Unlike commit (which spreads in-memory state),
+  // this re-reads the row fresh and merges only `predictions[playerId]` — so two
+  // people submitting near-simultaneously, or a result that auto-synced in the
+  // meantime, are never clobbered. Returns true on success.
+  async function savePrediction(playerId, picks) {
+    if (!sweepId || !playerId) return false;
+    setSave("saving");
+    const hit = await loadById(sweepId);
+    const base = hit ? hit.state : state;
+    const next = {
+      ...base,
+      predictions: {
+        ...(base.predictions || {}),
+        [playerId]: { picks, savedAt: new Date().toISOString() },
+      },
+    };
+    const ok = await saveSweep(sweepId, next);
+    setState(next);
+    setSave(ok ? "saved" : "error");
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => setSave("idle"), 2500);
+    return ok;
+  }
+
   // Adds new results to the current sweep AND silently syncs them to all other
   // sweepstakes remembered on this device. Edits/deletions stay scoped to the
   // current sweep — only brand-new results are broadcast.
@@ -1168,6 +1248,7 @@ export default function App() {
             setTab={setTab}
             unlocked={unlocked}
             tryUnlock={tryUnlock}
+            savePrediction={savePrediction}
             showReveal={() => setPhase("reveal")}
             onMatchdayReport={() => setShowShare(true)}
             goHome={goHome}
@@ -1678,7 +1759,7 @@ function DrawReveal({ state, onDone }) {
 // thirds are known; fill it then (one ~8-entry row) and the third slots resolve.
 // ESPN R32 fixtures override regardless. Everything past the R32 propagates from
 // match winners, so it needs no config.
-const R32_THIRD_COMBO = null; // e.g. { 74:"B", 77:"D", 79:"C", 80:"E", 81:"F", 82:"H", 85:"G", 87:"I" }
+const R32_THIRD_COMBO = { 74:"D", 77:"F", 79:"E", 80:"K", 81:"B", 82:"I", 85:"J", 87:"L" }; // realised 2026 combo (from published R32 fixtures); ESPN overrides per match anyway
 
 function BracketView({ state, stats, espnMatches = [] }) {
   const [groups, setGroups] = useState([]);
@@ -1698,6 +1779,30 @@ function BracketView({ state, stats, espnMatches = [] }) {
     const id = setInterval(load, 60_000);
     return () => { alive = false; clearInterval(id); };
   }, []);
+
+  // Zoom: the bracket is ~1500px wide, so by default scale the WHOLE tree (width
+  // and height) to fit the viewport; − / Fit / ＋ adjust, and zooming in pans.
+  const viewportRef = useRef(null), contentRef = useRef(null);
+  const [nat, setNat] = useState({ w: 1520, h: 760 }); // natural (unscaled) content size
+  const [vp, setVp] = useState({ w: 0, h: 0 });
+  const [zoom, setZoom] = useState(null);              // null = auto-fit
+  useLayoutEffect(() => {
+    if (!loaded) return;
+    const measure = () => {
+      if (contentRef.current) {
+        const w = contentRef.current.offsetWidth, h = contentRef.current.offsetHeight;
+        if (w && h) setNat(p => (p.w === w && p.h === h) ? p : { w, h });
+      }
+      if (viewportRef.current) setVp({ w: viewportRef.current.clientWidth, h: window.innerHeight });
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [loaded]);
+  const fit = (vp.w && vp.h)
+    ? Math.min(1, Math.max(0.12, Math.min((vp.w - 6) / nat.w, (vp.h * 0.72) / nat.h)))
+    : 1;
+  const z = zoom ?? fit;
 
   // Result index across EVERY stage (keyed `${stage}|${sortedPair}`) + the R32
   // `byTeam` opponent map for the third-place override. Committed results win over
@@ -1786,17 +1891,331 @@ function BracketView({ state, stats, espnMatches = [] }) {
         <div className="notice">Loading the bracket…</div>
       ) : (
         <>
-          <div className="bkt-tree">
-            {BRACKET_COLUMNS.left.map(col => column(col, "left", "L"))}
-            <div className="bkt-col bkt-col-center" key="center">
-              <div className="bkt-colhead">Final</div>
-              <div className="bkt-colbody">{BRACKET_COLUMNS.center.map(num => renderMatch(num, "center"))}</div>
-            </div>
-            {BRACKET_COLUMNS.right.map(col => column(col, "right", "R"))}
+          <div className="bkt-zoom">
+            <button type="button" aria-label="Zoom out" onClick={() => setZoom(Math.max(0.2, +(z / 1.2).toFixed(3)))}>−</button>
+            <button type="button" className="bkt-zoom-fit" onClick={() => setZoom(null)}>
+              {zoom == null ? "Fit" : `${Math.round(z * 100)}%`}
+            </button>
+            <button type="button" aria-label="Zoom in" onClick={() => setZoom(Math.min(2, +(z * 1.2).toFixed(3)))}>＋</button>
           </div>
-          <div className="bkt-thirdplace">
-            <div className="bkt-colhead bkt-3rd-head">Third-place play-off</div>
-            {renderMatch(103, "center")}
+          <div className="bkt-viewport" ref={viewportRef}>
+            <div className="bkt-sizer" style={{ width: nat.w * z, height: nat.h * z }}>
+              <div className="bkt-scaler" ref={contentRef} style={{ transform: `scale(${z})` }}>
+                <div className="bkt-tree">
+                  {BRACKET_COLUMNS.left.map(col => column(col, "left", "L"))}
+                  <div className="bkt-col bkt-col-center" key="center">
+                    <div className="bkt-colhead">Final</div>
+                    <div className="bkt-colbody">{BRACKET_COLUMNS.center.map(num => renderMatch(num, "center"))}</div>
+                  </div>
+                  {BRACKET_COLUMNS.right.map(col => column(col, "right", "R"))}
+                </div>
+                <div className="bkt-thirdplace">
+                  <div className="bkt-colhead bkt-3rd-head">Third-place play-off</div>
+                  {renderMatch(103, "center")}
+                </div>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---- Predictions (fill the blank knockout bracket, score against reality) ---- */
+function PredictionsView({ state, sweepId, stats, espnMatches = [], savePrediction }) {
+  const [groups, setGroups] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      try {
+        const res = await fetch('/.netlify/functions/standings');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.error) return;
+        if (alive) setGroups(data.groups || []);
+      } catch (_) {} finally { if (alive) setLoaded(true); }
+    }
+    load();
+    const id = setInterval(load, 60_000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  // Same actual-result index the live bracket builds — committed results win over
+  // ESPN; scores only count once a match has started (ESPN reports "0"/null before).
+  const { resultIndex, byTeam } = useMemo(() => {
+    const resultIndex = new Map(), byTeam = new Map();
+    const key = (stage, a, b) => `${stage}|${[a, b].sort().join('|')}`;
+    for (const m of espnMatches) {
+      const stage = apiRoundToStage(m.round);
+      const a = apiTeamId(m.homeTeam), b = apiTeamId(m.awayTeam);
+      if (!a || !b) continue;
+      const started = m.statusState === 'in' || m.statusState === 'post';
+      resultIndex.set(key(stage, a, b), { teamA: a, teamB: b, scoreA: Number(m.homeScore), scoreB: Number(m.awayScore), pensWinner: null, done: m.statusState === 'post', started });
+      if (stage === 'R32') { byTeam.set(a, b); byTeam.set(b, a); }
+    }
+    for (const r of state.results || []) {
+      if (!r.teamA || !r.teamB) continue;
+      resultIndex.set(key(r.stage, r.teamA, r.teamB), { teamA: r.teamA, teamB: r.teamB, scoreA: r.scoreA, scoreB: r.scoreB, pensWinner: r.pensWinner || null, done: !r.live, started: true });
+      if (r.stage === 'R32') { byTeam.set(r.teamA, r.teamB); byTeam.set(r.teamB, r.teamA); }
+    }
+    return { resultIndex, byTeam };
+  }, [espnMatches, state.results]);
+
+  const actualTree = useMemo(
+    () => resolveBracketTree(groups, R32_THIRD_COMBO, byTeam, resultIndex),
+    [groups, byTeam, resultIndex]
+  );
+
+  // The R32 is "set" once every tie has both real teams (groups done + thirds known).
+  // Predictions lock the moment the first R32 match kicks off — no organiser action.
+  const r32Seeded = useMemo(
+    () => [73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88]
+      .every(m => actualTree.get(m)?.a.teamId && actualTree.get(m)?.b.teamId),
+    [actualTree]
+  );
+  const locked = useMemo(
+    () => [...actualTree.values()].some(t => t.stage === 'R32' && t.result?.started),
+    [actualTree]
+  );
+  const actualDecided = useMemo(
+    () => [...actualTree.values()].filter(t => t.winner).length,
+    [actualTree]
+  );
+
+  // Identity: pick yourself from the existing players (honour system, like the rest
+  // of the app). Remembered per-device so you don't re-pick each visit.
+  const idKey = 'wc26_predictor_' + sweepId;
+  const [me, setMe] = useState(() => {
+    try { return localStorage.getItem(idKey) || ''; } catch { return ''; }
+  });
+  const chooseMe = (id) => {
+    setMe(id);
+    try { id ? localStorage.setItem(idKey, id) : localStorage.removeItem(idKey); } catch {}
+  };
+
+  // Editable picks for `me`. Reloaded only when the selected player changes — never
+  // on state.predictions, so an in-flight edit is never clobbered by a save/refresh.
+  const [picks, setPicks] = useState({});
+  const [dirty, setDirty] = useState(false);
+  useEffect(() => {
+    setPicks({ ...(state.predictions?.[me]?.picks || {}) });
+    setDirty(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me, sweepId]);
+
+  const predTree = useMemo(() => resolvePredictionTree(actualTree, picks), [actualTree, picks]);
+  const picked = useMemo(() => [...predTree.values()].filter(t => t.winner).length, [predTree]);
+
+  function pick(m, teamId) {
+    if (locked || !teamId) return;
+    setPicks(p => ({ ...p, [m]: teamId }));
+    setDirty(true);
+  }
+  async function onSave() {
+    if (!me) return;
+    const ok = await savePrediction(me, picks);
+    if (ok) setDirty(false);
+  }
+
+  // Leaderboard: everyone who has entered, scored against the actual tree (live).
+  const board = useMemo(() => {
+    const preds = state.predictions || {};
+    const rows = state.parts
+      .filter(p => preds[p.id]?.picks)
+      .map(p => ({ p, ...scorePrediction(actualTree, preds[p.id].picks) }))
+      .sort((a, b) => b.points - a.points || b.pct - a.pct || b.correct - a.correct || a.p.name.localeCompare(b.p.name));
+    let rank = 0, prev = null;
+    rows.forEach((r, i) => { if (r.points !== prev) { rank = i + 1; prev = r.points; } r.rank = rank; });
+    return rows;
+  }, [state.predictions, state.parts, actualTree]);
+
+  // ── zoom / fit (mirrors the live bracket) ──
+  const viewportRef = useRef(null), contentRef = useRef(null);
+  const [nat, setNat] = useState({ w: 1520, h: 760 });
+  const [vp, setVp] = useState({ w: 0, h: 0 });
+  const [zoom, setZoom] = useState(null);
+  useLayoutEffect(() => {
+    if (!loaded) return;
+    const measure = () => {
+      if (contentRef.current) {
+        const w = contentRef.current.offsetWidth, h = contentRef.current.offsetHeight;
+        if (w && h) setNat(p => (p.w === w && p.h === h) ? p : { w, h });
+      }
+      if (viewportRef.current) setVp({ w: viewportRef.current.clientWidth, h: window.innerHeight });
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [loaded, r32Seeded, me]);
+  const fit = (vp.w && vp.h) ? Math.min(1, Math.max(0.12, Math.min(vp.w / nat.w, (vp.h * 0.74) / nat.h))) : 1;
+  const z = zoom ?? fit;
+
+  const owned = stats.ownedTeams;
+
+  function renderSide(side, m) {
+    const t = predTree.get(m);
+    const actualWinner = actualTree.get(m)?.winner || null;
+    if (!side.teamId) return <div className="bkt-team bkt-ph bkt-pick-ph">{side.label}</div>;
+    const team = TEAM[side.teamId];
+    const isPick = t?.winner === side.teamId;
+    const decided = !!actualWinner;
+    const correct = locked && decided && isPick && actualWinner === side.teamId;
+    const wrong   = locked && decided && isPick && actualWinner !== side.teamId;
+    const actualHit = locked && decided && actualWinner === side.teamId && !isPick;
+    const pickable = !locked && side.teamId && predTree.get(m)?.a.teamId && predTree.get(m)?.b.teamId;
+    return (
+      <button
+        type="button"
+        className={cls("bkt-team bkt-pickbtn",
+          owned.has(side.teamId) && "bkt-own",
+          isPick && "bkt-pick", correct && "bkt-correct", wrong && "bkt-wrong", actualHit && "bkt-actual",
+          !pickable && "bkt-pick-locked")}
+        onClick={() => pick(m, side.teamId)}
+        disabled={!pickable}
+        title={correct ? "Correct" : wrong ? "Wrong" : actualHit ? "Actually advanced" : undefined}
+      >
+        <span className="bkt-flag">{team.flag}</span>
+        <span className="bkt-name">{team.name}</span>
+        {owned.has(side.teamId) && <span className="bkt-dot" title="Your team">●</span>}
+        {correct && <span className="bkt-mark bkt-mark-ok">✓</span>}
+        {wrong && <span className="bkt-mark bkt-mark-no">✗</span>}
+      </button>
+    );
+  }
+  function renderMatch(num, sideClass) {
+    const t = predTree.get(num);
+    if (!t) return null;
+    const label = t.stage === "FINAL" ? "Final" : t.stage === "THIRD" ? "3rd place" : `M${num}`;
+    return (
+      <div key={num} className={cls("bkt-tie", `bkt-${sideClass}`, t.stage === "FINAL" && "bkt-final")}>
+        <div className="bkt-num"><span>{label}</span></div>
+        {renderSide(t.a, num)}
+        {renderSide(t.b, num)}
+      </div>
+    );
+  }
+  const column = (col, sideClass, keyPrefix) => (
+    <div className="bkt-col" key={keyPrefix + col.stage}>
+      <div className="bkt-colhead">{STAGE[col.stage]?.short || col.stage}</div>
+      <div className="bkt-colbody">{col.ms.map(num => renderMatch(num, sideClass))}</div>
+    </div>
+  );
+
+  const champOf = (row) => row.predTree.get(104)?.winner ? TEAM[row.predTree.get(104).winner] : null;
+
+  return (
+    <div className="bracket-wrap">
+      <div className="board-eyebrow">
+        <span className="board-eyebrow-label">Predictions</span>
+        <div className="board-eyebrow-line" />
+        <span className="board-eyebrow-right">
+          {locked ? `Locked · ${actualDecided}/32 played` : r32Seeded ? "Open · locks at R32 kick-off" : "Opens when groups end"}
+        </span>
+      </div>
+
+      {!loaded ? (
+        <div className="notice">Loading the bracket…</div>
+      ) : !r32Seeded ? (
+        <div className="bkt-note">
+          Predictions open once the group stage finishes and the Round of 32 is set —
+          then you fill in every knockout winner, and your bracket locks the moment the
+          first R32 match kicks off. Scores update live as results land.
+        </div>
+      ) : (
+        <>
+          <div className="pred-bar">
+            <label className="pred-who">
+              <span>{locked ? "View bracket:" : "You are:"}</span>
+              <select value={me} onChange={e => chooseMe(e.target.value)}>
+                <option value="">— pick your name —</option>
+                {state.parts.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}{(state.predictions?.[p.id]?.picks) ? " ✓" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {me && !locked && (
+              <div className="pred-actions">
+                <span className="pred-progress">{picked}/32 picked</span>
+                <button type="button" className="pred-save" onClick={onSave} disabled={!dirty}>
+                  {dirty ? "Save my bracket" : "Saved"}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {!me ? (
+            <div className="bkt-note">Pick your name above to {locked ? "view a bracket" : "fill in your predictions"}.</div>
+          ) : (
+            <>
+              <div className="bkt-note">
+                {locked
+                  ? "Locked in. ✓ correct pick · ✗ missed · faded = the team that actually advanced. ● marks your sweep teams."
+                  : "Tap the team you think wins each tie — your pick flows into the next round. Later ties unlock once you've chosen both feeders. ● marks your sweep teams."}
+              </div>
+              <div className="bkt-zoom">
+                <button type="button" aria-label="Zoom out" onClick={() => setZoom(Math.max(0.2, +(z / 1.2).toFixed(3)))}>−</button>
+                <button type="button" className="bkt-zoom-fit" onClick={() => setZoom(null)}>{zoom == null ? "Fit" : `${Math.round(z * 100)}%`}</button>
+                <button type="button" aria-label="Zoom in" onClick={() => setZoom(Math.min(2, +(z * 1.2).toFixed(3)))}>＋</button>
+              </div>
+              <div className="bkt-viewport" ref={viewportRef}>
+                <div className="bkt-sizer" style={{ width: nat.w * z, height: nat.h * z }}>
+                  <div className="bkt-scaler" ref={contentRef} style={{ transform: `scale(${z})` }}>
+                    <div className="bkt-tree">
+                      {BRACKET_COLUMNS.left.map(col => column(col, "left", "L"))}
+                      <div className="bkt-col bkt-col-center" key="center">
+                        <div className="bkt-colhead">Final</div>
+                        <div className="bkt-colbody">{BRACKET_COLUMNS.center.map(num => renderMatch(num, "center"))}</div>
+                      </div>
+                      {BRACKET_COLUMNS.right.map(col => column(col, "right", "R"))}
+                    </div>
+                    <div className="bkt-thirdplace">
+                      <div className="bkt-colhead bkt-3rd-head">Third-place play-off</div>
+                      {renderMatch(103, "center")}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          <div className="pred-board-wrap">
+            <div className="board-eyebrow">
+              <span className="board-eyebrow-label">Leaderboard</span>
+              <div className="board-eyebrow-line" />
+              <span className="board-eyebrow-right">{board.length}/{state.parts.length} entered</span>
+            </div>
+            {board.length === 0 ? (
+              <div className="bkt-note">No predictions entered yet.</div>
+            ) : !locked && actualDecided === 0 ? (
+              <div className="pred-roster">
+                Entered: {board.map(r => r.p.name).join(" · ")} — scores appear once the knockouts begin.
+              </div>
+            ) : (
+              <table className="pred-table">
+                <thead>
+                  <tr><th>#</th><th>Name</th>{locked && <th>Champion</th>}<th className="num">Correct</th><th className="num">Points</th><th className="num">%</th></tr>
+                </thead>
+                <tbody>
+                  {board.map(r => {
+                    const champ = champOf(r);
+                    return (
+                      <tr key={r.p.id} className={cls(r.p.id === me && "pred-me")}>
+                        <td>{r.rank}</td>
+                        <td>{r.p.name}</td>
+                        {locked && <td className="pred-champ">{champ ? <>{champ.flag} {champ.name}</> : <span className="bkt-ph">—</span>}</td>}
+                        <td className="num">{r.correct}/{r.decided}</td>
+                        <td className="num">{r.points}</td>
+                        <td className="num">{r.pct}%</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
           </div>
         </>
       )}
@@ -1807,7 +2226,7 @@ function BracketView({ state, stats, espnMatches = [] }) {
 /* ---- Main shell ---- */
 function Main({
   state, sweepId, known, commit, refresh, saveStatus, tab, setTab,
-  unlocked, tryUnlock, showReveal, onMatchdayReport, resetAll, goHome, goAdmin, switchTo, addResultsToAll,
+  unlocked, tryUnlock, savePrediction, showReveal, onMatchdayReport, resetAll, goHome, goAdmin, switchTo, addResultsToAll,
 }) {
   const [espnMatches, setEspnMatches] = useState([]);
   useEffect(() => {
@@ -1858,7 +2277,7 @@ function Main({
     () => buildStats({ ...state, results: [...(state.results || []), ...provisionalLive] }),
     [state, provisionalLive]
   );
-  const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["bracket","Bracket"],["howto","How it works"],["setup","Setup"]];
+  const tabs  = [["table","Table"],["teams","Teams"],["matches","Matches"],["bracket","Bracket"],["predict","Predictions"],["howto","How it works"],["setup","Setup"]];
   const others = known.filter(k => k.id !== sweepId);
   return (
     <div className="main">
@@ -1905,6 +2324,7 @@ function Main({
       {tab === "teams"   && <TeamsView   state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} />}
       {tab === "matches" && <MatchesView state={state} stats={stats} commit={commit} unlocked={unlocked} tryUnlock={tryUnlock} addResultsToAll={addResultsToAll} espnMatches={espnMatches} />}
       {tab === "bracket" && <BracketView state={state} stats={stats} espnMatches={espnMatches} />}
+      {tab === "predict" && <PredictionsView state={state} sweepId={sweepId} stats={stats} espnMatches={espnMatches} savePrediction={savePrediction} />}
       {tab === "howto"   && <HowItWorks  state={state} stats={stats} />}
       {tab === "setup"   && (
         <SetupView
@@ -3211,8 +3631,15 @@ function Styles() {
 
       /* Knockout bracket — two-sided tree */
       .bracket-wrap   { padding: 4px 0 24px; }
-      .bkt-note       { font-size: 12px; color: var(--muted); margin: 10px 0 16px; line-height: 1.5; }
-      .bkt-tree       { display: flex; align-items: stretch; gap: 16px; overflow-x: auto; padding: 4px 2px 14px; min-height: 640px; }
+      .bkt-note       { font-size: 12px; color: var(--muted); margin: 10px 0 12px; line-height: 1.5; }
+      .bkt-zoom       { display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-bottom: 8px; }
+      .bkt-zoom button { min-width: 30px; height: 30px; padding: 0; border: 1px solid var(--line); background: var(--card); border-radius: 6px; font: 700 17px/1 'Space Grotesk',sans-serif; color: var(--ink); display: flex; align-items: center; justify-content: center; }
+      .bkt-zoom button:hover { border-color: var(--accent-line); color: var(--accent); }
+      .bkt-zoom .bkt-zoom-fit { min-width: 56px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+      .bkt-viewport   { overflow: auto; max-height: 78vh; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); -webkit-overflow-scrolling: touch; }
+      .bkt-sizer      { overflow: hidden; }
+      .bkt-scaler     { display: inline-block; transform-origin: top left; }
+      .bkt-tree       { display: flex; align-items: stretch; gap: 16px; width: max-content; padding: 6px 8px 14px; min-height: 640px; }
       .bkt-col        { display: flex; flex-direction: column; flex: 0 0 auto; width: 152px; }
       .bkt-col-center { width: 172px; }
       .bkt-colhead    { font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--faint); font-weight: 700; text-align: center; padding-bottom: 8px; }
@@ -3237,6 +3664,39 @@ function Styles() {
       .bkt-dead .bkt-name { text-decoration: line-through; text-decoration-color: var(--muted); }
       .bkt-thirdplace { margin-top: 14px; max-width: 230px; }
       .bkt-3rd-head   { text-align: left; }
+
+      /* Predictions — tappable bracket + leaderboard (reuses .bkt-* layout) */
+      .bkt-pickbtn    { width: 100%; text-align: left; background: none; border: 0; border-radius: 4px; cursor: pointer; color: inherit; font: inherit; }
+      .bkt-pickbtn:disabled { cursor: default; }
+      .bkt-pickbtn:not(:disabled):hover { background: var(--bg); }
+      .bkt-pick       { background: var(--accent-line); }
+      .bkt-pick .bkt-name { color: var(--accent); font-weight: 700; }
+      .bkt-pick-locked:not(.bkt-pick) { opacity: .8; }
+      .bkt-correct    { background: #e7f3ec; }
+      .bkt-correct .bkt-name { color: var(--win); }
+      .bkt-wrong      { background: #f7e3e4; }
+      .bkt-wrong .bkt-name   { color: var(--accent); text-decoration: line-through; text-decoration-color: var(--accent-line); }
+      .bkt-actual .bkt-name  { color: var(--win); }
+      .bkt-mark       { font-size: 10px; font-weight: 800; line-height: 1; }
+      .bkt-mark-ok    { color: var(--win); }
+      .bkt-mark-no    { color: var(--accent); }
+      .bkt-pick-ph    { padding-left: 6px; }
+
+      .pred-bar       { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 6px 0 4px; }
+      .pred-who       { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--muted); }
+      .pred-who select { font: inherit; font-weight: 600; color: var(--ink); padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); }
+      .pred-actions   { display: flex; align-items: center; gap: 10px; }
+      .pred-progress  { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--muted); font-variant-numeric: tabular-nums; }
+      .pred-save      { padding: 7px 14px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; font: 700 12px/1 'Space Grotesk',sans-serif; cursor: pointer; }
+      .pred-save:disabled { background: var(--card); color: var(--muted); border-color: var(--line); cursor: default; }
+      .pred-board-wrap { margin-top: 8px; }
+      .pred-roster    { font-size: 12px; color: var(--muted); line-height: 1.6; }
+      .pred-table     { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .pred-table th  { text-align: left; font-size: 9.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); padding: 6px 10px; border-bottom: 1px solid var(--line); }
+      .pred-table td  { padding: 9px 10px; border-bottom: 1px solid var(--line); font-weight: 600; }
+      .pred-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+      .pred-table .pred-champ { color: var(--muted); font-weight: 600; }
+      .pred-table tr.pred-me td { background: var(--accent-line); }
 
       /* Commentary & results */
       .board-commentary    { margin-top: 18px; display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; background: var(--card); border: 1px solid var(--line); border-radius: 4px; animation: rise .4s .3s ease both; }
