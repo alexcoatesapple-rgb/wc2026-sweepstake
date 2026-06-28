@@ -4,7 +4,7 @@
 > `session-closeout` skill). One source of truth for "what's shipped and what's in
 > flight" — keep it short.
 
-**Version:** 1.3.0 (`package.json`)
+**Version:** 1.3.1 (`package.json`)
 **Host:** Netlify — push to `main` auto-deploys to production.
 
 ## What works today
@@ -26,6 +26,14 @@
 
 ## Recently shipped
 
+- **v1.3.1 — Predictions polish** — save button moved to a sticky bottom bar
+  (`.pred-savebar`); `savePrediction` only updates in-memory state on a successful
+  write (a failed save no longer shows as saved); save-button label no longer reads
+  "Saved" before anything is saved; **click any leaderboard name to load that
+  player's bracket** (`viewPlayer` → `chooseMe`, scrolls up). Honour-system caveats
+  left as-is by choice: pre-lock you can view/edit any name; viewing persists the
+  device's remembered name. Verified build + `npm test` (39). NOT deployed.
+  2026-06-28.
 - **v1.3.0 — Predictions tab + bracket zoom** — players fill in the blank knockout
   bracket (winner of every R32→Final tie), saved against their existing player name
   (`state.predictions[playerId].picks`, honour system — no auth). Opens once the R32
