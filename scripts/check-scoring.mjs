@@ -23,13 +23,17 @@ function grab(label, re) {
 const code =
   grab("DEFAULT_SCORING",   /const DEFAULT_SCORING = \{[\s\S]*?\};/) + "\n" +
   grab("API_TEAM_MAP",      /const API_TEAM_MAP = \{[\s\S]*?\};/) + "\n" +
+  grab("STAGES",            /const STAGES = \[[\s\S]*?\];/) + "\n" +
+  grab("STAGE",             /const STAGE = Object\.fromEntries[\s\S]*?;/) + "\n" +
   grab("apiTeamId",         /function apiTeamId[\s\S]*?\n\}/) + "\n" +
+  grab("apiRoundToStage",   /function apiRoundToStage[\s\S]*?\n\}/) + "\n" +
+  grab("apiPensWinner",     /function apiPensWinner[\s\S]*?\n\}/) + "\n" +
   grab("koWinner",          /function koWinner[\s\S]*?\n\}/) + "\n" +
   grab("teamMatchPts",      /function teamMatchPts[\s\S]*?\n\}/) + "\n" +
   grab("buildStats",        /function buildStats[\s\S]*?\n\}/) + "\n" +
   grab("deriveFromStandings", /function deriveFromStandings[\s\S]*?\n\}/) + "\n" +
-  "return { DEFAULT_SCORING, koWinner, teamMatchPts, buildStats, deriveFromStandings };";
-const { DEFAULT_SCORING: SC, koWinner, teamMatchPts, buildStats, deriveFromStandings } = new Function(code)();
+  "return { DEFAULT_SCORING, apiRoundToStage, apiPensWinner, koWinner, teamMatchPts, buildStats, deriveFromStandings };";
+const { DEFAULT_SCORING: SC, apiRoundToStage, apiPensWinner, koWinner, teamMatchPts, buildStats, deriveFromStandings } = new Function(code)();
 
 let passed = 0, failed = 0;
 const eq = (label, got, want) => {
@@ -56,6 +60,34 @@ eq("KO pens winner",        pts("a", { stage:"QF", teamA:"a", teamB:"b", scoreA:
 eq("KO pens loser",         pts("b", { stage:"QF", teamA:"a", teamB:"b", scoreA:1, scoreB:1, pensWinner:"a" }), 0);
 // Team not in the match scores nothing
 eq("team not in match",     pts("z", { stage:"GROUP", teamA:"a", teamB:"b", scoreA:1, scoreB:0 }), 0);
+
+// ---- apiRoundToStage (the proxy now folds season.slug into the round text, so
+// a pens game whose note is "X advance N-N on penalties" is no longer mis-staged
+// as a group game — the slug "round-of-32" carries the real round) -------------
+eq("round: slug round-of-32",      apiRoundToStage("round-of-32"), "R32");
+eq("round: slug round-of-16",      apiRoundToStage("round-of-16"), "R16");
+eq("round: slug quarterfinals",    apiRoundToStage("quarterfinals"), "QF");
+eq("round: slug semifinals",       apiRoundToStage("semifinals"), "SF");
+eq("round: slug + pens note → R32", apiRoundToStage("round-of-32 Paraguay advance 4-3 on penalties"), "R32");
+eq("round: group note still wins", apiRoundToStage("fifa.world Group A"), "GROUP");
+
+// ---- apiPensWinner (auto pens winner from the ESPN shootout feed) -----------
+// ESPN keeps the regulation/ET score (1-1) and the shootout (home/awayShootout)
+// separate; a level KO tie is settled by the higher shootout tally.
+const em = (round, hs, as, hsh = null, ash = null) =>
+  ({ round, homeScore: hs, awayScore: as, homeShootout: hsh, awayShootout: ash });
+eq("pens: home wins shootout",  apiPensWinner(em("Round of 32", 1, 1, 4, 3), "ger", "par"), "ger");
+eq("pens: away wins shootout",  apiPensWinner(em("Round of 32", 1, 1, 2, 3), "mar", "ned"), "ned");
+eq("pens: third-place shootout", apiPensWinner(em("Play-off for Third Place", 0, 0, 5, 4), "a", "b"), "a");
+eq("pens: clear KO win → null (score decides)", apiPensWinner(em("Round of 16", 2, 1), "a", "b"), null);
+eq("pens: level but shootout not posted yet → null", apiPensWinner(em("Quarterfinal", 1, 1), "a", "b"), null);
+eq("pens: group draw → null (not knockout)", apiPensWinner(em("Group A", 1, 1, 4, 3), "a", "b"), null);
+// Coercion guards: a double-digit shootout must compare numerically, not as
+// strings ("10" < "9" lexicographically would crown the loser), and a one-sided
+// null must not pick a winner of a non-existent shootout.
+eq("pens: double-digit (numeric)",  apiPensWinner(em("Round of 32", 1, 1, 10, 9), "a", "b"), "a");
+eq("pens: double-digit (string inputs coerced)", apiPensWinner(em("Round of 32", 1, 1, "10", "9"), "a", "b"), "a");
+eq("pens: one-sided null → null",   apiPensWinner(em("Round of 32", 1, 1, 5, null), "a", "b"), null);
 
 // ---- koWinner --------------------------------------------------------------
 eq("koWinner A",     koWinner({ teamA:"a", teamB:"b", scoreA:2, scoreB:1 }), "a");

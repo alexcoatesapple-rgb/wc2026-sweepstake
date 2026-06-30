@@ -53,11 +53,20 @@ exports.handler = async (event) => {
       const redCardsHome = details.filter(d => d.redCard && d.team?.id === home.team.id).length;
       const redCardsAway = details.filter(d => d.redCard && d.team?.id === away.team.id).length;
 
-      // Real round/stage. ESPN puts it in competition notes (e.g.
-      // "Group A", "Round of 16", "Quarterfinal"). The season slug is
-      // NOT the round, so it must not be used here.
-      const noteHeadline =
-        (comp.notes || []).map(n => n.headline || n.text).filter(Boolean).join(" ");
+      // Real round/stage. ESPN splits this across two fields and which one
+      // carries it depends on the stage:
+      //   • Group stage: the note headline holds it (e.g. "Group A").
+      //   • Knockouts: the round lives in season.slug (e.g. "round-of-32"),
+      //     while notes hold EVENT annotations like "X advance 4-3 on
+      //     penalties" — NOT the round. Reading that note as the round mis-stages
+      //     a knockout tie as a group game (it has no R32/R16/QF/… keyword).
+      // So combine BOTH sources, drop the penalty-result annotation, and let
+      // apiRoundToStage pick the round keyword out of whichever field has it.
+      const roundNotes = (comp.notes || [])
+        .map(n => n.headline || n.text)
+        .filter(Boolean)
+        .filter(t => !/penalt/i.test(t));
+      const noteHeadline = [e.season?.slug, ...roundNotes].filter(Boolean).join(" ");
 
       return {
         id: e.id,
@@ -70,9 +79,14 @@ exports.handler = async (event) => {
         homeScore: home.score ?? null,
         awayTeam: away.team.displayName,
         awayScore: away.score ?? null,
+        // Penalty-shootout tally — present only when a knockout tie went to pens.
+        // ESPN keeps it separate from `score` (which stays the regulation/ET
+        // score, e.g. 1-1), so the app can derive the pens winner automatically.
+        homeShootout: home.shootoutScore ?? null,
+        awayShootout: away.shootoutScore ?? null,
         redCardsHome,
         redCardsAway,
-        round: noteHeadline || e.season?.slug || null,
+        round: noteHeadline || null,
       };
     });
 
