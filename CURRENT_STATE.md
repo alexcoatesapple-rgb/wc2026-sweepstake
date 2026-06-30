@@ -4,7 +4,7 @@
 > `session-closeout` skill). One source of truth for "what's shipped and what's in
 > flight" — keep it short.
 
-**Version:** 1.3.2 (`package.json`)
+**Version:** 1.3.3 (`package.json`)
 **Host:** Netlify — push to `main` auto-deploys to production.
 
 ## What works today
@@ -26,6 +26,23 @@
 
 ## Recently shipped
 
+- **v1.3.3 — Auto-resolve knockout penalty shootouts** — fixes pens ties that were
+  mis-stored as **group games with no winner** (the "edit every sweep by hand" pain).
+  Two stacked bugs: (1) the `fixtures` proxy read ESPN's `"X advance N-N on
+  penalties"` NOTE as the round → no KO keyword → defaulted GROUP; it now folds
+  `season.slug` (`"round-of-32"`) + notes (minus the pens annotation) so the real
+  round is found wherever ESPN hides it. (2) No pens winner was derived; new
+  `apiPensWinner` reads ESPN's per-competitor `shootoutScore` (now forwarded by the
+  proxy) and sets `pensWinner` for a level KO tie (`Number`-coerced — a string
+  compare would mis-rank a 10-9 shootout). `mergeInto` now matches `espn_` results by
+  their stable event id and **corrects the stage in place** (GROUP→R32), so
+  already-broken live sweeps **self-heal on the next sync** — clearing the phantom
+  group-draw points, no manual editing. Human `imp_`/`m…` results stay untouchable
+  (golden rule #3). Verified: build / `npm test` (49) / live production-window ESPN
+  feed (Paraguay + Morocco pens correct) / two independent reviews (one real bug —
+  the string compare — found and fixed). Golden rule #6 updated (the slug DOES carry
+  the KO round). Known edge: a sweep where you *added a new* R32 row but left the
+  stale GROUP row behind won't fully self-heal — delete the extra row once. 2026-06-30.
 - **v1.3.2 — Predictions: enter anytime, per-tie write-once** — replaced the global
   "lock the whole bracket at first R32 kick-off" rule (which slammed the entry window
   shut the moment the first knockout game started — the bug that prompted this).
@@ -71,8 +88,8 @@
   winners (and SF losers → 3rd place) from results; only finished matches advance.
   Resolver validated in a scratchpad sim (propagation, pens, live-no-advance);
   build / `npm test` (34) / live preview desktop+mobile. Known: a pens game ESPN
-  can't resolve stalls that branch until the organiser enters the pens winner.
-  2026-06-27.
+  can't resolve stalls that branch until the organiser enters the pens winner
+  (auto-resolved from ESPN's `shootoutScore` in v1.3.3). 2026-06-27.
 - **v1.1.0 — Knockout bracket (Bracket tab)** — see "What works today". Came out of
   a brainstorm on auto-filling the R32 as groups finish. Deliberately did **not**
   transcribe all 495 Annexe C rows: one realised `R32_THIRD_COMBO` row + ESPN

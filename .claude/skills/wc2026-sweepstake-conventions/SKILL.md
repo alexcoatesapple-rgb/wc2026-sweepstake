@@ -65,8 +65,13 @@ rule, nothing is.
    `API_TEAM_MAP` mirrors `TEAMS` (ESPN name → team id); `apiRoundToStage` maps
    ESPN round text → `STAGE` id. An unmapped team is **silently dropped**
    (`return []`) — add the mapping whenever you touch teams/stages.
-6. **The ESPN season slug is NOT the round.** Round comes only from competition
-   notes (see `netlify/functions/fixtures.js`). Never derive stage from the slug.
+6. **The ESPN round lives in different fields per stage — combine them, don't
+   trust one.** Group stage: the note headline carries it ("Group A"). Knockouts:
+   it's in `season.slug` ("round-of-32"), while notes hold EVENT annotations like
+   "X advance 4-3 on penalties" — reading that note as the round mis-stages a KO
+   tie as a GROUP game (the bug fixed v1.3.3). So `fixtures.js` folds slug + notes
+   (minus penalty annotations) into `round`, and `apiRoundToStage`'s keyword order
+   (group→32→16→QF→SF→third→final) picks the round out of whichever field has it.
 7. **Live (in-progress) matches score provisionally but must not eliminate teams.**
    Only finished, non-`live` knockout results set elimination in `buildStats`.
 8. **Row `id` IS the view PIN** (one indexed lookup); the organiser PIN gates

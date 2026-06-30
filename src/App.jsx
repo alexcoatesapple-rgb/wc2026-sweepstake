@@ -189,6 +189,25 @@ function apiRoundToStage(round) {
   return "GROUP";
 }
 
+// Penalty-shootout winner for an ESPN match, or null. ESPN reports the
+// regulation/ET score (e.g. 1-1) and the shootout separately on each competitor
+// (`shootoutScore`), forwarded by the proxy as home/awayShootout. Only a LEVEL
+// knockout tie is settled on pens — group games and clear KO wins resolve from
+// the score (via koWinner), so this stays null for them. `hId`/`aId` are the
+// home/away team ids, matching the home/away shootout fields.
+function apiPensWinner(m, hId, aId) {
+  if (!STAGE[apiRoundToStage(m.round)]?.ko) return null;
+  if ((Number(m.homeScore) || 0) !== (Number(m.awayScore) || 0)) return null;
+  // Guard nulls BEFORE coercing — Number(null) is 0, which would pass a finite
+  // check and pick a winner of a non-existent shootout. Then coerce: ESPN gives
+  // no type contract (scores arrive as strings), so a string compare would rank
+  // "10" below "9" and crown the loser of a double-digit shootout.
+  if (m.homeShootout == null || m.awayShootout == null) return null;
+  const ph = Number(m.homeShootout), pa = Number(m.awayShootout);
+  if (!Number.isFinite(ph) || !Number.isFinite(pa) || ph === pa) return null;
+  return ph > pa ? hId : aId;
+}
+
 function apiFixturesToPasteText(matches) {
   return matches.map(m => {
     const hId = apiTeamId(m.homeTeam);
@@ -1081,9 +1100,15 @@ export default function App() {
       const merged = [...(existing || [])];
       for (const nr of newResults) {
         const idx = merged.findIndex(er =>
-          er.stage === nr.stage &&
-          ((er.teamA === nr.teamA && er.teamB === nr.teamB) ||
-           (er.teamA === nr.teamB && er.teamB === nr.teamA))
+          // Machine-synced results carry a stable ESPN event id, so match on it
+          // first — a tie first stored under the wrong stage (e.g. a pens game
+          // the old proxy mis-read as a group game) is then CORRECTED in place,
+          // not duplicated. Manual results use the stage+pair identity (golden
+          // rule #3); their ids never collide with an espn_ id.
+          (nr.id?.startsWith("espn_") && er.id === nr.id) ||
+          (er.stage === nr.stage &&
+           ((er.teamA === nr.teamA && er.teamB === nr.teamB) ||
+            (er.teamA === nr.teamB && er.teamB === nr.teamA)))
         );
         if (idx === -1) {
           merged.push(nr);
@@ -1099,9 +1124,18 @@ export default function App() {
           const scoreB = flipped ? nr.scoreA : nr.scoreB;
           const redsA  = flipped ? nr.redsB  : nr.redsA;
           const redsB  = flipped ? nr.redsA  : nr.redsB;
-          if (er.scoreA !== scoreA || er.scoreB !== scoreB ||
-              er.redsA  !== redsA  || er.redsB  !== redsB) {
-            merged[idx] = { ...er, scoreA, scoreB, redsA, redsB };
+          // pensWinner is a team id (position-independent, no flip). Take ESPN's
+          // newly-derived winner, but never regress a known winner back to null
+          // if a later poll lacks the shootout data. This lets an already-stored
+          // espn_ result that stalled on a level KO tie self-heal once pens post.
+          const pensWinner = nr.pensWinner ?? er.pensWinner ?? null;
+          if (er.stage !== nr.stage ||
+              er.scoreA !== scoreA || er.scoreB !== scoreB ||
+              er.redsA  !== redsA  || er.redsB  !== redsB ||
+              (er.pensWinner ?? null) !== pensWinner) {
+            // Correct the stage too — a mis-staged espn_ result (GROUP→R32) heals
+            // here, clearing the phantom group-draw points it was awarding.
+            merged[idx] = { ...er, stage: nr.stage, scoreA, scoreB, redsA, redsB, pensWinner };
             changed = true;
           }
         }
@@ -1145,7 +1179,7 @@ export default function App() {
             scoreB: Number(m.awayScore) || 0,
             redsA: m.redCardsHome || 0,
             redsB: m.redCardsAway || 0,
-            pensWinner: null,
+            pensWinner: apiPensWinner(m, hId, aId),
             at: m.date,
           }];
         });
@@ -1826,7 +1860,7 @@ function BracketView({ state, stats, espnMatches = [] }) {
       const a = apiTeamId(m.homeTeam), b = apiTeamId(m.awayTeam);
       if (!a || !b) continue;
       const started = m.statusState === 'in' || m.statusState === 'post';
-      resultIndex.set(key(stage, a, b), { teamA: a, teamB: b, scoreA: Number(m.homeScore), scoreB: Number(m.awayScore), pensWinner: null, done: m.statusState === 'post', started });
+      resultIndex.set(key(stage, a, b), { teamA: a, teamB: b, scoreA: Number(m.homeScore), scoreB: Number(m.awayScore), pensWinner: apiPensWinner(m, a, b), done: m.statusState === 'post', started });
       if (stage === 'R32') { byTeam.set(a, b); byTeam.set(b, a); }
     }
     for (const r of state.results || []) {
@@ -1962,7 +1996,7 @@ function PredictionsView({ state, sweepId, stats, espnMatches = [], savePredicti
       const a = apiTeamId(m.homeTeam), b = apiTeamId(m.awayTeam);
       if (!a || !b) continue;
       const started = m.statusState === 'in' || m.statusState === 'post';
-      resultIndex.set(key(stage, a, b), { teamA: a, teamB: b, scoreA: Number(m.homeScore), scoreB: Number(m.awayScore), pensWinner: null, done: m.statusState === 'post', started });
+      resultIndex.set(key(stage, a, b), { teamA: a, teamB: b, scoreA: Number(m.homeScore), scoreB: Number(m.awayScore), pensWinner: apiPensWinner(m, a, b), done: m.statusState === 'post', started });
       if (stage === 'R32') { byTeam.set(a, b); byTeam.set(b, a); }
     }
     for (const r of state.results || []) {
